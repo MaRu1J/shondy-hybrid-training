@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:ac55d124da4882b497f732d8dfd9a702d5447a5f29d08d56da6f64f0a1eb34bc
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/shondy
+ARG SHONDY_HYBRID_CONTRACT_INDEX_URL
+ENV PIP_EXTRA_INDEX_URL=${SHONDY_HYBRID_CONTRACT_INDEX_URL}
+
+COPY requirements-cuda12.8.lock /tmp/requirements.lock
+RUN python3 -m pip install --break-system-packages --no-deps -r /tmp/requirements.lock
+
+RUN python3 -m pip install --break-system-packages --no-deps \
+    shondy-hybrid-contract==1.0.0 \
+    && python3 -m pip check
+
+COPY . /opt/shondy/training
+RUN python3 -m pip install --break-system-packages --no-deps /opt/shondy/training \
+    && python3 -m pip check
+
+RUN python3 -c "import onnxruntime as ort; assert 'CUDAExecutionProvider' in ort.get_available_providers()"
+
+ENTRYPOINT ["shondy-train-hybrid"]

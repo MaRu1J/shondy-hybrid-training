@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shondy-hybrid-training"
+version = "0.1.0"
+description = "Streaming training and bundle export for the ShonDy hybrid surrogate"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "shondy-hybrid-contract==1.0.0",
+  "h5py==3.16.0",
+  "numpy==2.5.2",
+  "onnx==1.22.0",
+  "onnxruntime-gpu==1.23.2",
+  "scipy==1.18.0",
+  "torch==2.9.1",
+]
+
+[project.scripts]
+shondy-train-hybrid = "train_hybrid_model:main"
+
+[project.optional-dependencies]
+test = [
+  "pytest==9.1.1",
+  "ruff==0.16.4",
+]
+
+[tool.setuptools]
+py-modules = ["hybrid_reference_model", "train_hybrid_model"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_hybrid_reference_model.py"]
