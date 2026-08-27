@@ -7,17 +7,19 @@ import hashlib
 import json
 import math
 import os
+import queue
 import random
 import tempfile
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Self, cast
 
 import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from shondy_hybrid_contract import CONTRACT, REGISTRY_SHA256, validate_model_bundle
 
 TEACHER_SCHEMA_VERSION = int(CONTRACT["teacher"]["schemaVersion"])
@@ -280,6 +282,39 @@ class TeacherFrameIndex:
         return self.case_id, self.trajectory_id, self.macro_step_index
 
 
+@dataclass(frozen=True)
+class TrainingFrameData:
+    """Minimal frame payload used after the Teacher file has been validated."""
+
+    index: TeacherFrameIndex
+    position_start: np.ndarray
+    local_feature_start: np.ndarray
+    target_residual_acceleration: np.ndarray
+    valid: np.ndarray
+    radius_start: np.ndarray | None = None
+    wall_channels_start: np.ndarray | None = None
+
+    @property
+    def frame_key(self) -> tuple[str, str, int]:
+        return self.index.frame_key
+
+    @property
+    def geometry(self) -> GridGeometry:
+        return self.index.geometry
+
+    @property
+    def nbytes(self) -> int:
+        arrays = (
+            self.position_start,
+            self.local_feature_start,
+            self.target_residual_acceleration,
+            self.valid,
+            self.radius_start,
+            self.wall_channels_start,
+        )
+        return sum(value.nbytes for value in arrays if value is not None)
+
+
 def _attribute_text(value: object, name: str) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
@@ -415,9 +450,7 @@ def _validate_particle_arrays(frame: TeacherFrame) -> None:
     validate_wall_channels(wall_channels, frame.geometry)
 
 
-def _teacher_file_contract(
-    file: h5py.File,
-) -> tuple[
+type TeacherFileContract = tuple[
     str,
     str,
     float,
@@ -426,7 +459,10 @@ def _teacher_file_contract(
     GridGeometry,
     tuple[str, ...],
     tuple[float, ...],
-]:
+]
+
+
+def _teacher_file_contract(file: h5py.File) -> TeacherFileContract:
     teacher_contract = CONTRACT["teacher"]
     grid_contract = CONTRACT["grid"]
     if (
@@ -560,16 +596,7 @@ def _index_teacher_frame(
     source_path: Path,
     frame_name: str,
     group: h5py.Group,
-    file_contract: tuple[
-        str,
-        str,
-        float,
-        float,
-        str,
-        GridGeometry,
-        tuple[str, ...],
-        tuple[float, ...],
-    ],
+    file_contract: TeacherFileContract,
 ) -> TeacherFrameIndex:
     (
         case_id,
@@ -671,57 +698,57 @@ def index_teacher_trajectory(path: str | Path) -> tuple[TeacherFrameIndex, ...]:
     return indexes
 
 
-def load_teacher_frame(index: TeacherFrameIndex) -> TeacherFrame:
-    """Load and validate exactly one indexed Teacher frame."""
-
-    with h5py.File(index.source_path, "r") as file:
-        file_contract = _teacher_file_contract(file)
-        current_index = _index_teacher_frame(
-            index.source_path,
-            index.frame_name,
-            file["frames"][index.frame_name],
-            file_contract,
-        )
-        if current_index != index:
-            raise ContractError(f"Teacher frame metadata changed: {index.frame_key}.")
-        group = file["frames"][index.frame_name]
-        particle = group["particle"]
-        valid_raw = _required_array(particle, "valid")
-        if not np.isin(valid_raw, (0, 1)).all():
-            raise ContractError("Particle valid mask must contain only 0 or 1.")
-        frame = TeacherFrame(
-            source_path=index.source_path,
-            case_id=index.case_id,
-            trajectory_id=index.trajectory_id,
-            macro_step_index=index.macro_step_index,
-            time_start=index.time_start,
-            time_end=index.time_end,
-            ai_delta_time=index.ai_delta_time,
-            particle_diameter=index.particle_diameter,
-            certification_profile=index.certification_profile,
-            substep_count=index.substep_count,
-            valid_grid_support=index.valid_grid_support,
-            geometry=index.geometry,
-            condition_names=index.condition_names,
-            conditions=index.conditions,
-            static_id=_required_array(particle, "staticId"),
-            position_start=_required_array(particle, "positionStart"),
-            velocity_start=_required_array(particle, "velocityStart"),
-            radius_start=_required_array(particle, "radiusStart"),
-            local_feature_start=_required_array(particle, "localFeatureStart"),
-            position_end=_required_array(particle, "positionEnd"),
-            velocity_end=_required_array(particle, "velocityEnd"),
-            gravity_reference_velocity_end=_required_array(
-                particle, "gravityReferenceVelocityEnd"
-            ),
-            target_residual_acceleration=_required_array(
-                particle, "targetResidualAcceleration"
-            ),
-            valid=valid_raw.astype(np.bool_),
-            wall_start=_load_wall_state(group["wallStart"]),
-            wall_end=_load_wall_state(group["wallEnd"]),
-            wall_channels_start=_required_array(group["grid"], "wallStart"),
-        )
+def _load_teacher_frame_from_file(
+    index: TeacherFrameIndex,
+    file: h5py.File,
+    file_contract: TeacherFileContract,
+) -> TeacherFrame:
+    current_index = _index_teacher_frame(
+        index.source_path,
+        index.frame_name,
+        file["frames"][index.frame_name],
+        file_contract,
+    )
+    if current_index != index:
+        raise ContractError(f"Teacher frame metadata changed: {index.frame_key}.")
+    group = file["frames"][index.frame_name]
+    particle = group["particle"]
+    valid_raw = _required_array(particle, "valid")
+    if not np.isin(valid_raw, (0, 1)).all():
+        raise ContractError("Particle valid mask must contain only 0 or 1.")
+    frame = TeacherFrame(
+        source_path=index.source_path,
+        case_id=index.case_id,
+        trajectory_id=index.trajectory_id,
+        macro_step_index=index.macro_step_index,
+        time_start=index.time_start,
+        time_end=index.time_end,
+        ai_delta_time=index.ai_delta_time,
+        particle_diameter=index.particle_diameter,
+        certification_profile=index.certification_profile,
+        substep_count=index.substep_count,
+        valid_grid_support=index.valid_grid_support,
+        geometry=index.geometry,
+        condition_names=index.condition_names,
+        conditions=index.conditions,
+        static_id=_required_array(particle, "staticId"),
+        position_start=_required_array(particle, "positionStart"),
+        velocity_start=_required_array(particle, "velocityStart"),
+        radius_start=_required_array(particle, "radiusStart"),
+        local_feature_start=_required_array(particle, "localFeatureStart"),
+        position_end=_required_array(particle, "positionEnd"),
+        velocity_end=_required_array(particle, "velocityEnd"),
+        gravity_reference_velocity_end=_required_array(
+            particle, "gravityReferenceVelocityEnd"
+        ),
+        target_residual_acceleration=_required_array(
+            particle, "targetResidualAcceleration"
+        ),
+        valid=valid_raw.astype(np.bool_),
+        wall_start=_load_wall_state(group["wallStart"]),
+        wall_end=_load_wall_state(group["wallEnd"]),
+        wall_channels_start=_required_array(group["grid"], "wallStart"),
+    )
     _validate_particle_arrays(frame)
     if not np.allclose(
         frame.radius_start,
@@ -731,6 +758,219 @@ def load_teacher_frame(index: TeacherFrameIndex) -> TeacherFrame:
     ):
         raise ContractError("Teacher radiusStart and particleDiameter disagree.")
     return frame
+
+
+def load_teacher_frame(index: TeacherFrameIndex) -> TeacherFrame:
+    """Load and validate exactly one indexed Teacher frame."""
+
+    with h5py.File(index.source_path, "r") as file:
+        return _load_teacher_frame_from_file(index, file, _teacher_file_contract(file))
+
+
+class _TeacherFrameReader:
+    """Keep one validated HDF5 handle open per Teacher trajectory."""
+
+    def __init__(self) -> None:
+        self._files: dict[Path, h5py.File] = {}
+        self._contracts: dict[Path, TeacherFileContract] = {}
+
+    def _file(
+        self, index: TeacherFrameIndex
+    ) -> tuple[h5py.File, TeacherFileContract]:
+        path = index.source_path
+        if path not in self._files:
+            file = h5py.File(path, "r")
+            try:
+                contract = _teacher_file_contract(file)
+            except Exception:
+                file.close()
+                raise
+            self._files[path] = file
+            self._contracts[path] = contract
+        return self._files[path], self._contracts[path]
+
+    def load_validated(self, index: TeacherFrameIndex) -> TeacherFrame:
+        file, contract = self._file(index)
+        return _load_teacher_frame_from_file(index, file, contract)
+
+    def load_training(
+        self,
+        index: TeacherFrameIndex,
+        *,
+        include_radius: bool,
+        include_wall: bool,
+    ) -> TrainingFrameData:
+        file, contract = self._file(index)
+        current_index = _index_teacher_frame(
+            index.source_path,
+            index.frame_name,
+            file["frames"][index.frame_name],
+            contract,
+        )
+        if current_index != index:
+            raise ContractError(f"Teacher frame metadata changed: {index.frame_key}.")
+        group = file["frames"][index.frame_name]
+        particle = group["particle"]
+        valid_raw = _required_array(particle, "valid")
+        if valid_raw.shape != (index.particle_count,) or not np.isin(
+            valid_raw, (0, 1)
+        ).all():
+            raise ContractError("Particle valid mask must contain only 0 or 1.")
+        if not np.any(valid_raw):
+            raise ContractError("MSE requires at least one valid finite target.")
+        position = _required_array(particle, "positionStart")
+        local = _required_array(particle, "localFeatureStart")
+        target = _required_array(particle, "targetResidualAcceleration")
+        if position.shape != (index.particle_count, 3):
+            raise ContractError("positionStart must have shape [P,3].")
+        if local.shape != (index.particle_count, LOCAL_FEATURE_COUNT):
+            raise ContractError("localFeatureStart must have shape [P,18].")
+        if target.shape != (index.particle_count, TARGET_CHANNEL_COUNT):
+            raise ContractError("targetResidualAcceleration must have shape [P,3].")
+        radius = _required_array(particle, "radiusStart") if include_radius else None
+        if radius is not None and radius.shape != (index.particle_count,):
+            raise ContractError("radiusStart must have shape [P].")
+        wall = _required_array(group["grid"], "wallStart") if include_wall else None
+        if wall is not None and wall.shape != (
+            WALL_GRID_CHANNEL_COUNT,
+            *index.geometry.tensor_shape,
+        ):
+            raise ContractError("wallStart grid has an invalid shape.")
+        return TrainingFrameData(
+            index=index,
+            position_start=position,
+            radius_start=radius,
+            local_feature_start=local,
+            target_residual_acceleration=target,
+            valid=valid_raw.astype(np.bool_),
+            wall_channels_start=wall,
+        )
+
+    def load_radii(self, index: TeacherFrameIndex) -> np.ndarray:
+        file, contract = self._file(index)
+        current_index = _index_teacher_frame(
+            index.source_path,
+            index.frame_name,
+            file["frames"][index.frame_name],
+            contract,
+        )
+        if current_index != index:
+            raise ContractError(f"Teacher frame metadata changed: {index.frame_key}.")
+        radii = _required_array(
+            file["frames"][index.frame_name]["particle"], "radiusStart"
+        )
+        if radii.shape != (index.particle_count,):
+            raise ContractError("radiusStart must have shape [P].")
+        return radii
+
+    def close(self) -> None:
+        for file in self._files.values():
+            file.close()
+        self._files.clear()
+        self._contracts.clear()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+_PREFETCH_DONE = object()
+
+
+@dataclass(frozen=True)
+class _PrefetchFailure:
+    error: Exception
+
+
+def _iter_with_reader[LoadedFrame](
+    indexes: Sequence[TeacherFrameIndex],
+    loader: Callable[[_TeacherFrameReader, TeacherFrameIndex], LoadedFrame],
+    *,
+    prefetch_frames: int,
+) -> Iterable[LoadedFrame]:
+    """Load frames in order, optionally overlapping I/O with device work."""
+
+    if prefetch_frames < 0:
+        raise ContractError("prefetch_frames must be non-negative.")
+    if prefetch_frames == 0:
+        with _TeacherFrameReader() as reader:
+            for index in indexes:
+                yield loader(reader, index)
+        return
+
+    pending: queue.Queue[object] = queue.Queue(maxsize=prefetch_frames)
+    stop = threading.Event()
+
+    def enqueue(value: object) -> bool:
+        while not stop.is_set():
+            try:
+                pending.put(value, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce() -> None:
+        try:
+            with _TeacherFrameReader() as reader:
+                for index in indexes:
+                    if not enqueue(loader(reader, index)):
+                        return
+        except Exception as error:  # noqa: BLE001 - forward worker failures verbatim.
+            enqueue(_PrefetchFailure(error))
+        finally:
+            enqueue(_PREFETCH_DONE)
+
+    worker = threading.Thread(
+        target=produce, name="shondy-teacher-prefetch", daemon=True
+    )
+    worker.start()
+    try:
+        while True:
+            value = pending.get()
+            if value is _PREFETCH_DONE:
+                break
+            if isinstance(value, _PrefetchFailure):
+                raise value.error
+            yield cast(LoadedFrame, value)
+    finally:
+        stop.set()
+        worker.join()
+
+
+def iter_validated_teacher_frames(
+    indexes: Sequence[TeacherFrameIndex], *, prefetch_frames: int = 0
+) -> Iterable[TeacherFrame]:
+    return _iter_with_reader(
+        indexes,
+        lambda reader, index: reader.load_validated(index),
+        prefetch_frames=prefetch_frames,
+    )
+
+
+def iter_training_frame_data(
+    indexes: Sequence[TeacherFrameIndex],
+    *,
+    dynamic_grid_cache: Mapping[tuple[str, str, int], torch.Tensor],
+    wall_grid_cache: Mapping[Path, torch.Tensor],
+    training_frame_cache: Mapping[tuple[str, str, int], TrainingFrameData],
+    prefetch_frames: int = 0,
+) -> Iterable[TrainingFrameData]:
+    def load(
+        reader: _TeacherFrameReader, index: TeacherFrameIndex
+    ) -> TrainingFrameData:
+        cached = training_frame_cache.get(index.frame_key)
+        if cached is not None:
+            return cached
+        return reader.load_training(
+            index,
+            include_radius=index.frame_key not in dynamic_grid_cache,
+            include_wall=index.source_path not in wall_grid_cache,
+        )
+
+    return _iter_with_reader(indexes, load, prefetch_frames=prefetch_frames)
 
 
 def load_teacher_trajectory(path: str | Path) -> tuple[TeacherFrame, ...]:
@@ -755,13 +995,15 @@ class TrilinearStencil:
 
 
 def trilinear_stencil(
-    positions: torch.Tensor, geometry: GridGeometry
+    positions: torch.Tensor, geometry: GridGeometry, *, validate: bool = True
 ) -> TrilinearStencil:
     """Build the deterministic 8-cell stencil without clamping."""
 
     if positions.ndim != 2 or positions.shape[1] != 3:
         raise ContractError("positions must have shape [P,3].")
-    if not positions.is_floating_point() or not torch.isfinite(positions).all():
+    if not positions.is_floating_point() or (
+        validate and not torch.isfinite(positions).all()
+    ):
         raise ContractError("positions must be finite floating-point values.")
     minimum = torch.tensor(
         geometry.padded_bounds_min,
@@ -822,6 +1064,7 @@ def reference_p2g(
     geometry: GridGeometry,
     *,
     eps: float = 1.0e-12,
+    validate: bool = True,
 ) -> P2GResult:
     """Volume-weight particle quantities onto a dense x-contiguous grid."""
 
@@ -845,13 +1088,14 @@ def reference_p2g(
             raise ContractError(f"{name} has invalid shape.")
         if value.device != positions.device or value.dtype != positions.dtype:
             raise ContractError(f"{name} must match position dtype and device.")
-        if not torch.isfinite(value).all():
+        if validate and not torch.isfinite(value).all():
             raise ContractError(f"{name} must be finite.")
-    if torch.any(radii <= 0.0):
+    if validate and torch.any(radii <= 0.0):
         raise ContractError("Particle radii must be positive.")
 
-    stencil = trilinear_stencil(positions, geometry)
-    stencil.require_complete()
+    stencil = trilinear_stencil(positions, geometry, validate=validate)
+    if validate:
+        stencil.require_complete()
     volume = particle_volume_from_radius(radii)
     weighted_volume = volume[:, None] * stencil.weights
     linear = stencil.linear_indices.reshape(-1)
@@ -900,6 +1144,8 @@ def reference_g2p(
     grid_latent: torch.Tensor,
     positions: torch.Tensor,
     geometry: GridGeometry,
+    *,
+    validate: bool = True,
 ) -> torch.Tensor:
     """Interpolate a dense latent grid to particles with the P2G stencil."""
 
@@ -911,8 +1157,9 @@ def reference_g2p(
         raise ContractError("grid_latent must have shape [C,Nz,Ny,Nx].")
     if grid_latent.device != positions.device or grid_latent.dtype != positions.dtype:
         raise ContractError("grid_latent must match position dtype and device.")
-    stencil = trilinear_stencil(positions, geometry)
-    stencil.require_complete()
+    stencil = trilinear_stencil(positions, geometry, validate=validate)
+    if validate:
+        stencil.require_complete()
     channels = grid_latent.shape[0]
     flat = grid_latent.reshape(channels, geometry.cell_count)
     gathered = flat[:, stencil.linear_indices]
@@ -1082,6 +1329,8 @@ def assemble_grid_input(
     geometry: GridGeometry,
     condition_values: torch.Tensor,
     condition_statistics: FeatureStatistics | None,
+    *,
+    validate_wall: bool = True,
 ) -> torch.Tensor:
     """Assemble one `[1,19+K,Nz,Ny,Nx]` grid encoder input."""
 
@@ -1090,7 +1339,8 @@ def assemble_grid_input(
         *geometry.tensor_shape,
     ):
         raise ContractError("normalized_dynamic_grid has invalid shape.")
-    validate_wall_channels(wall_channels, geometry)
+    if validate_wall:
+        validate_wall_channels(wall_channels, geometry)
     if normalized_dynamic_grid.dtype != wall_channels.dtype or (
         normalized_dynamic_grid.device != wall_channels.device
     ):
@@ -1175,6 +1425,42 @@ def _frame_tensors(frame: TeacherFrame) -> dict[str, torch.Tensor]:
     }
 
 
+def _training_data_tensors(
+    frame: TrainingFrameData,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype | None = None,
+) -> dict[str, torch.Tensor]:
+    if dtype is None:
+        dtype = (
+            torch.float64
+            if frame.position_start.dtype == np.float64
+            else torch.float32
+        )
+
+    def transfer(value: np.ndarray, *, tensor_dtype: torch.dtype) -> torch.Tensor:
+        return torch.as_tensor(value, dtype=tensor_dtype).to(
+            device=device, non_blocking=True
+        )
+
+    local = transfer(frame.local_feature_start, tensor_dtype=dtype)
+    result = {
+        "positions": transfer(frame.position_start, tensor_dtype=dtype),
+        "velocity": local[:, 0:3],
+        "normalized_density": local[:, 3],
+        "previous_residual": local[:, 8:11],
+        "local_features": local,
+        "target": transfer(frame.target_residual_acceleration, tensor_dtype=dtype),
+        "valid": transfer(frame.valid, tensor_dtype=torch.bool),
+        "conditions": torch.as_tensor(frame.index.conditions, dtype=dtype).to(
+            device=device, non_blocking=True
+        ),
+    }
+    if frame.radius_start is not None:
+        result["radii"] = transfer(frame.radius_start, tensor_dtype=dtype)
+    return result
+
+
 def require_common_dataset_contract(samples: Sequence[HybridFrameSample]) -> None:
     if not samples:
         raise ContractError("At least one frame sample is required.")
@@ -1256,22 +1542,56 @@ def compute_base_training_statistics(
 def compute_base_training_statistics_streaming(
     indexes: Sequence[TeacherFrameIndex],
     split: TrajectorySplit,
+    *,
+    device: torch.device | str = "cpu",
+    dynamic_grid_cache: MutableMapping[
+        tuple[str, str, int], torch.Tensor
+    ] | None = None,
+    dynamic_grid_cache_max_bytes: int = 0,
+    wall_grid_cache: MutableMapping[Path, torch.Tensor] | None = None,
+    training_frame_cache: MutableMapping[
+        tuple[str, str, int], TrainingFrameData
+    ] | None = None,
+    training_frame_cache_max_bytes: int = 0,
+    prefetch_frames: int = 0,
 ) -> TrainingStatistics:
     """First pass: compute training-only statistics one indexed frame at a time."""
 
     require_common_frame_contract(indexes)
+    if dynamic_grid_cache_max_bytes < 0 or training_frame_cache_max_bytes < 0:
+        raise ContractError("Training cache byte limits must be non-negative.")
     dynamic_running = _RunningStatistics(DYNAMIC_QUANTITY_COUNT)
     condition_count = len(indexes[0].condition_names)
     condition_running = (
         _RunningStatistics(condition_count) if condition_count != 0 else None
     )
     target_running = _RunningStatistics(TARGET_CHANNEL_COUNT)
+    selected_indexes = [
+        index
+        for index in indexes
+        if split.assignment(index) == "training" and index.valid_grid_support
+    ]
+    indexes_by_key = {index.frame_key: index for index in selected_indexes}
     accepted = 0
-    for index in indexes:
-        if split.assignment(index) != "training" or not index.valid_grid_support:
-            continue
-        frame = load_teacher_frame(index)
+    cached_bytes = sum(
+        value.numel() * value.element_size()
+        for value in dynamic_grid_cache.values()
+    ) if dynamic_grid_cache is not None else 0
+    cached_training_bytes = (
+        sum(value.nbytes for value in training_frame_cache.values())
+        if training_frame_cache is not None
+        else 0
+    )
+    for frame in iter_validated_teacher_frames(
+        selected_indexes, prefetch_frames=prefetch_frames
+    ):
+        if not np.any(frame.valid):
+            raise ContractError("MSE requires at least one valid finite target.")
         tensors = _frame_tensors(frame)
+        tensors = {
+            name: value.to(device=device, non_blocking=True)
+            for name, value in tensors.items()
+        }
         p2g = reference_p2g(
             tensors["positions"],
             tensors["radii"],
@@ -1282,6 +1602,48 @@ def compute_base_training_statistics_streaming(
         )
         occupied = p2g.dynamic_grid[7] > 1.0e-12
         dynamic_running.update(p2g.dynamic_grid[:7, occupied].transpose(0, 1))
+        if dynamic_grid_cache is not None and frame.frame_key not in dynamic_grid_cache:
+            grid_bytes = p2g.dynamic_grid.numel() * p2g.dynamic_grid.element_size()
+            if cached_bytes + grid_bytes <= dynamic_grid_cache_max_bytes:
+                dynamic_grid_cache[frame.frame_key] = (
+                    p2g.dynamic_grid.detach().to(device="cpu").contiguous()
+                )
+                cached_bytes += grid_bytes
+        if (
+            wall_grid_cache is not None
+            and frame.certification_profile
+            == CONTRACT["certificationProfiles"]["firstRelease"]
+            and frame.source_path not in wall_grid_cache
+        ):
+            wall_grid_cache[frame.source_path] = (
+                torch.as_tensor(frame.wall_channels_start).clone().contiguous()
+            )
+        if training_frame_cache is not None and frame.frame_key not in training_frame_cache:
+            cached_frame = TrainingFrameData(
+                index=indexes_by_key[frame.frame_key],
+                position_start=frame.position_start,
+                radius_start=(
+                    None
+                    if dynamic_grid_cache is not None
+                    and frame.frame_key in dynamic_grid_cache
+                    else frame.radius_start
+                ),
+                local_feature_start=frame.local_feature_start,
+                target_residual_acceleration=frame.target_residual_acceleration,
+                valid=frame.valid,
+                wall_channels_start=(
+                    None
+                    if wall_grid_cache is not None
+                    and frame.source_path in wall_grid_cache
+                    else frame.wall_channels_start
+                ),
+            )
+            if (
+                cached_training_bytes + cached_frame.nbytes
+                <= training_frame_cache_max_bytes
+            ):
+                training_frame_cache[frame.frame_key] = cached_frame
+                cached_training_bytes += cached_frame.nbytes
         if condition_running is not None:
             condition_running.update(tensors["conditions"].view(1, -1))
         target_running.update(tensors["target"][tensors["valid"]])
@@ -1296,7 +1658,11 @@ def compute_base_training_statistics_streaming(
 
 
 def prepare_indexed_frame(
-    index: TeacherFrameIndex, statistics: TrainingStatistics
+    index: TeacherFrameIndex,
+    statistics: TrainingStatistics,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
 ) -> PreparedFrame:
     frame = load_teacher_frame(index)
     return prepare_frame(
@@ -1305,11 +1671,17 @@ def prepare_indexed_frame(
             wall_channels=torch.as_tensor(frame.wall_channels_start),
         ),
         statistics,
+        device=device,
+        dtype=dtype,
     )
 
 
 def prepare_frame(
-    sample: HybridFrameSample, statistics: TrainingStatistics
+    sample: HybridFrameSample,
+    statistics: TrainingStatistics,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
 ) -> PreparedFrame:
     frame = sample.frame
     if not frame.valid_grid_support:
@@ -1317,6 +1689,15 @@ def prepare_frame(
             f"Frame {frame.frame_key} is marked invalid for grid support."
         )
     tensors = _frame_tensors(frame)
+    if device is not None:
+        tensors = {
+            name: value.to(
+                device=device,
+                dtype=(dtype if value.is_floating_point() else value.dtype),
+                non_blocking=True,
+            )
+            for name, value in tensors.items()
+        }
     wall_channels = sample.wall_channels.to(
         dtype=tensors["positions"].dtype, device=tensors["positions"].device
     )
@@ -1353,6 +1734,125 @@ def prepare_frame(
         standardized_target=standardized_target,
         valid=valid,
     )
+
+
+def prepare_training_frame(
+    frame: TrainingFrameData,
+    statistics: TrainingStatistics,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype | None,
+    dynamic_grid: torch.Tensor | None,
+    wall_channels: torch.Tensor | None,
+) -> PreparedFrame:
+    """Prepare an already validated frame without reloading unused Teacher fields."""
+
+    if not frame.index.valid_grid_support:
+        raise IncompleteGridSupportError(
+            f"Frame {frame.frame_key} is marked invalid for grid support."
+        )
+    tensors = _training_data_tensors(frame, device=device, dtype=dtype)
+    if dynamic_grid is None:
+        radii = tensors.get("radii")
+        if radii is None:
+            raise ContractError("Uncached training frames require radiusStart.")
+        dynamic_grid = reference_p2g(
+            tensors["positions"],
+            radii,
+            tensors["velocity"],
+            tensors["normalized_density"],
+            tensors["previous_residual"],
+            frame.geometry,
+            validate=False,
+        ).dynamic_grid
+    else:
+        dynamic_grid = dynamic_grid.to(
+            device=device, dtype=tensors["positions"].dtype, non_blocking=True
+        )
+    normalized_dynamic = normalize_dynamic_grid(dynamic_grid, statistics.dynamic)
+    if wall_channels is None:
+        if frame.wall_channels_start is None:
+            raise ContractError("Uncached training frames require wallStart.")
+        wall_channels = torch.as_tensor(frame.wall_channels_start).to(
+            device=device, dtype=tensors["positions"].dtype, non_blocking=True
+        )
+    else:
+        wall_channels = wall_channels.to(
+            device=device, dtype=tensors["positions"].dtype, non_blocking=True
+        )
+    grid_input = assemble_grid_input(
+        normalized_dynamic,
+        wall_channels,
+        frame.geometry,
+        tensors["conditions"],
+        statistics.condition,
+        validate_wall=False,
+    )
+    target_stats = statistics.target.to(
+        dtype=tensors["target"].dtype, device=tensors["target"].device
+    )
+    standardized_target = torch.full_like(tensors["target"], float("nan"))
+    valid = tensors["valid"]
+    standardized_target[valid] = (
+        tensors["target"][valid] - target_stats.mean
+    ) / target_stats.std
+    return PreparedFrame(
+        frame_key=frame.frame_key,
+        geometry=frame.geometry,
+        grid_input=grid_input,
+        positions=tensors["positions"],
+        local_features=tensors["local_features"],
+        standardized_target=standardized_target,
+        valid=valid,
+    )
+
+
+def iter_prepared_training_frames(
+    indexes: Sequence[TeacherFrameIndex],
+    statistics: TrainingStatistics,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype | None = None,
+    dynamic_grid_cache: Mapping[tuple[str, str, int], torch.Tensor] | None = None,
+    wall_grid_cache: Mapping[Path, torch.Tensor] | None = None,
+    training_frame_cache: Mapping[
+        tuple[str, str, int], TrainingFrameData
+    ] | None = None,
+    prefetch_frames: int = 0,
+    validated_indexes: bool = False,
+) -> Iterable[PreparedFrame]:
+    dynamic_cache = dynamic_grid_cache or {}
+    wall_cache = wall_grid_cache or {}
+    frame_cache = training_frame_cache or {}
+    if not validated_indexes:
+        for frame in iter_validated_teacher_frames(
+            indexes, prefetch_frames=prefetch_frames
+        ):
+            yield prepare_frame(
+                HybridFrameSample(
+                    frame=frame,
+                    wall_channels=torch.as_tensor(frame.wall_channels_start),
+                ),
+                statistics,
+                device=device,
+                dtype=dtype,
+            )
+        return
+    for frame in iter_training_frame_data(
+        indexes,
+        dynamic_grid_cache=dynamic_cache,
+        wall_grid_cache=wall_cache,
+        training_frame_cache=frame_cache,
+        prefetch_frames=prefetch_frames,
+    ):
+        yield prepare_training_frame(
+            frame,
+            statistics,
+            device=device,
+            dtype=dtype,
+            dynamic_grid=dynamic_cache.get(frame.frame_key),
+            wall_channels=wall_cache.get(frame.index.source_path),
+        )
 
 
 @dataclass(frozen=True)
@@ -1604,24 +2104,33 @@ class HybridReferenceModel(torch.nn.Module):
         positions: torch.Tensor,
         local_features: torch.Tensor,
         geometry: GridGeometry,
+        validate_inputs: bool = True,
     ) -> torch.Tensor:
         if local_features.shape != (positions.shape[0], LOCAL_FEATURE_COUNT):
             raise ContractError("local_features must have shape [P,18].")
         grid_latent = self.standardized_grid_latent(grid_input)
-        particle_latent = reference_g2p(grid_latent, positions, geometry)
+        particle_latent = reference_g2p(
+            grid_latent, positions, geometry, validate=validate_inputs
+        )
         return self.particle_mlp(torch.cat((local_features, particle_latent), dim=1))
 
 
 def standardized_target_mse(
-    prediction: torch.Tensor, target: torch.Tensor, valid: torch.Tensor
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    validated: bool = False,
 ) -> torch.Tensor:
     if prediction.shape != target.shape or prediction.shape[-1] != TARGET_CHANNEL_COUNT:
         raise ContractError("Prediction and target must have aligned [P,3] shape.")
     if valid.shape != (prediction.shape[0],) or valid.dtype != torch.bool:
         raise ContractError("valid must be a boolean particle mask.")
-    selected = torch.logical_and(valid, torch.isfinite(target).all(dim=1))
-    if not torch.any(selected):
-        raise ContractError("MSE requires at least one valid finite target.")
+    selected = valid
+    if not validated:
+        selected = torch.logical_and(valid, torch.isfinite(target).all(dim=1))
+        if not torch.any(selected):
+            raise ContractError("MSE requires at least one valid finite target.")
     return F.mse_loss(prediction[selected], target[selected])
 
 
@@ -1704,6 +2213,14 @@ def compute_particle_latent_statistics_streaming(
     indexes: Sequence[TeacherFrameIndex],
     statistics: TrainingStatistics,
     split: TrajectorySplit,
+    *,
+    dynamic_grid_cache: Mapping[tuple[str, str, int], torch.Tensor] | None = None,
+    wall_grid_cache: Mapping[Path, torch.Tensor] | None = None,
+    training_frame_cache: Mapping[
+        tuple[str, str, int], TrainingFrameData
+    ] | None = None,
+    prefetch_frames: int = 0,
+    validated_indexes: bool = False,
 ) -> FeatureStatistics:
     """Measure training latent statistics while retaining one prepared frame."""
 
@@ -1715,18 +2232,31 @@ def compute_particle_latent_statistics_streaming(
     model.eval()
     accepted = 0
     with torch.no_grad():
-        for index in indexes:
-            if split.assignment(index) != "training" or not index.valid_grid_support:
-                continue
-            frame = prepare_indexed_frame(index, statistics)
-            grid_input = frame.grid_input.to(
-                device=parameter.device, dtype=parameter.dtype
+        selected_indexes = [
+            index
+            for index in indexes
+            if split.assignment(index) == "training" and index.valid_grid_support
+        ]
+        for frame in iter_prepared_training_frames(
+            selected_indexes,
+            statistics,
+            device=parameter.device,
+            dtype=parameter.dtype,
+            dynamic_grid_cache=dynamic_grid_cache,
+            wall_grid_cache=wall_grid_cache,
+            training_frame_cache=training_frame_cache,
+            prefetch_frames=prefetch_frames,
+            validated_indexes=validated_indexes,
+        ):
+            raw_grid = model.raw_grid_latent(frame.grid_input)
+            running.update(
+                reference_g2p(
+                    raw_grid,
+                    frame.positions,
+                    frame.geometry,
+                    validate=not validated_indexes,
+                )
             )
-            positions = frame.positions.to(
-                device=parameter.device, dtype=parameter.dtype
-            )
-            raw_grid = model.raw_grid_latent(grid_input)
-            running.update(reference_g2p(raw_grid, positions, frame.geometry))
             accepted += 1
     model.train(was_training)
     if accepted == 0:
@@ -1839,6 +2369,13 @@ def train_reference_model_streaming(
     device: torch.device | str = "cuda",
     seed: int = 1729,
     epoch_callback: Callable[[int, float], None] | None = None,
+    dynamic_grid_cache: Mapping[tuple[str, str, int], torch.Tensor] | None = None,
+    wall_grid_cache: Mapping[Path, torch.Tensor] | None = None,
+    training_frame_cache: Mapping[
+        tuple[str, str, int], TrainingFrameData
+    ] | None = None,
+    prefetch_frames: int = 0,
+    validated_indexes: bool = False,
 ) -> TrainingResult:
     """Train from shuffled frame keys without retaining prepared frames."""
 
@@ -1857,7 +2394,15 @@ def train_reference_model_streaming(
         raise ContractError("Invalid training hyperparameters.")
     model.to(device=device)
     initial_latent = compute_particle_latent_statistics_streaming(
-        model, valid_indexes, statistics, split
+        model,
+        valid_indexes,
+        statistics,
+        split,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=prefetch_frames,
+        validated_indexes=validated_indexes,
     )
     calibrate_latent_standardization(model, initial_latent)
     optimizer = torch.optim.AdamW(
@@ -1869,35 +2414,50 @@ def train_reference_model_streaming(
     for epoch_index in range(epochs):
         model.train()
         random_generator.shuffle(order)
-        loss_sum = 0.0
-        for index in order:
-            frame = prepare_indexed_frame(index, statistics)
-            parameter = next(model.parameters())
-            grid_input = frame.grid_input.to(
-                device=parameter.device, dtype=parameter.dtype
-            )
-            positions = frame.positions.to(
-                device=parameter.device, dtype=parameter.dtype
-            )
-            local = frame.local_features.to(
-                device=parameter.device, dtype=parameter.dtype
-            )
-            target = frame.standardized_target.to(
-                device=parameter.device, dtype=parameter.dtype
-            )
-            valid = frame.valid.to(device=parameter.device)
+        parameter = next(model.parameters())
+        loss_sum = torch.zeros((), dtype=torch.float64, device=parameter.device)
+        for frame in iter_prepared_training_frames(
+            order,
+            statistics,
+            device=parameter.device,
+            dtype=parameter.dtype,
+            dynamic_grid_cache=dynamic_grid_cache,
+            wall_grid_cache=wall_grid_cache,
+            training_frame_cache=training_frame_cache,
+            prefetch_frames=prefetch_frames,
+            validated_indexes=validated_indexes,
+        ):
             optimizer.zero_grad(set_to_none=True)
-            prediction = model(grid_input, positions, local, frame.geometry)
-            loss = standardized_target_mse(prediction, target, valid)
+            prediction = model(
+                frame.grid_input,
+                frame.positions,
+                frame.local_features,
+                frame.geometry,
+                validate_inputs=not validated_indexes,
+            )
+            loss = standardized_target_mse(
+                prediction,
+                frame.standardized_target,
+                frame.valid,
+                validated=validated_indexes,
+            )
             loss.backward()
             optimizer.step()
-            loss_sum += float(loss.detach().cpu())
-        epoch_loss = loss_sum / len(order)
+            loss_sum.add_(loss.detach().to(dtype=torch.float64))
+        epoch_loss = float((loss_sum / len(order)).cpu())
         history.append(epoch_loss)
         if epoch_callback is not None:
             epoch_callback(epoch_index + 1, epoch_loss)
     final_latent = compute_particle_latent_statistics_streaming(
-        model, valid_indexes, statistics, split
+        model,
+        valid_indexes,
+        statistics,
+        split,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=prefetch_frames,
+        validated_indexes=validated_indexes,
     )
     calibrate_latent_standardization(model, final_latent)
     return TrainingResult(tuple(history), final_latent)
@@ -2128,32 +2688,40 @@ def export_reference_artifacts(
         ):
             raise ContractError("Export frames do not share one model contract.")
     particle_radius: float | None = None
-    for frame_reference in frames:
-        frame = (
-            frame_reference
-            if isinstance(frame_reference, TeacherFrame)
-            else load_teacher_frame(frame_reference)
-        )
-        radii = frame.radius_start
-        if radii.size == 0 or not np.isfinite(radii).all() or np.any(radii <= 0.0):
-            raise ContractError("Teacher particle radii must be finite and positive.")
-        if not np.allclose(radii, radii[0], rtol=1.0e-6, atol=0.0):
-            raise ContractError("The first baseline requires one particle resolution.")
-        if particle_radius is None:
-            particle_radius = float(radii[0])
-        elif not math.isclose(
-            float(radii[0]), particle_radius, rel_tol=1.0e-6, abs_tol=0.0
-        ):
-            raise ContractError("The first baseline requires one particle resolution.")
-        if not math.isclose(
-            2.0 * float(radii[0]),
-            particle_diameter,
-            rel_tol=1.0e-6,
-            abs_tol=0.0,
-        ):
-            raise ContractError(
-                "Teacher radius and particleDiameter metadata disagree."
+    with _TeacherFrameReader() as reader:
+        for frame_reference in frames:
+            radii = (
+                frame_reference.radius_start
+                if isinstance(frame_reference, TeacherFrame)
+                else reader.load_radii(frame_reference)
             )
+            if (
+                radii.size == 0
+                or not np.isfinite(radii).all()
+                or np.any(radii <= 0.0)
+            ):
+                raise ContractError("Teacher particle radii must be finite and positive.")
+            if not np.allclose(radii, radii[0], rtol=1.0e-6, atol=0.0):
+                raise ContractError(
+                    "The first baseline requires one particle resolution."
+                )
+            if particle_radius is None:
+                particle_radius = float(radii[0])
+            elif not math.isclose(
+                float(radii[0]), particle_radius, rel_tol=1.0e-6, abs_tol=0.0
+            ):
+                raise ContractError(
+                    "The first baseline requires one particle resolution."
+                )
+            if not math.isclose(
+                2.0 * float(radii[0]),
+                particle_diameter,
+                rel_tol=1.0e-6,
+                abs_tol=0.0,
+            ):
+                raise ContractError(
+                    "Teacher radius and particleDiameter metadata disagree."
+                )
     if particle_radius is None:
         raise ContractError("Export metadata requires particle radius data.")
 

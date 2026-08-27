@@ -29,7 +29,32 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--preprocessing-device",
+        help=(
+            "Device for the one-time P2G statistics pass; defaults to --device. "
+            "Use cpu to retain the legacy P2G reduction numerics."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1729)
+    parser.add_argument(
+        "--prefetch-frames",
+        type=int,
+        default=2,
+        help="Validated Teacher frames to load ahead while the device is training.",
+    )
+    parser.add_argument(
+        "--dynamic-grid-cache-gib",
+        type=float,
+        default=8.0,
+        help="Maximum host-memory cache for deterministic P2G grids; zero disables it.",
+    )
+    parser.add_argument(
+        "--training-frame-cache-gib",
+        type=float,
+        default=16.0,
+        help="Maximum host-memory cache for minimal validated frame tensors.",
+    )
     parser.add_argument(
         "--frame-subset-count",
         type=int,
@@ -144,6 +169,13 @@ def evaluate_standardized_mse_diagnostics(
     statistics: hybrid.TrainingStatistics,
     *,
     device: torch.device | str,
+    dynamic_grid_cache: dict[tuple[str, str, int], torch.Tensor] | None = None,
+    wall_grid_cache: dict[Path, torch.Tensor] | None = None,
+    training_frame_cache: dict[
+        tuple[str, str, int], hybrid.TrainingFrameData
+    ] | None = None,
+    prefetch_frames: int = 0,
+    validated_indexes: bool = False,
 ) -> dict[str, Any] | None:
     if not indexes:
         return None
@@ -164,19 +196,28 @@ def evaluate_standardized_mse_diagnostics(
     }
     total_target_squared = 0.0
     per_frame: list[dict[str, Any]] = []
-    for index in indexes:
-        frame = hybrid.prepare_indexed_frame(index, statistics)
-        parameter = next(model.parameters())
-        local = frame.local_features.to(device=parameter.device, dtype=parameter.dtype)
-        target = frame.standardized_target.to(
-            device=parameter.device, dtype=parameter.dtype
-        )
-        valid = frame.valid.to(device=parameter.device)
+    parameter = next(model.parameters())
+    frames = hybrid.iter_prepared_training_frames(
+        indexes,
+        statistics,
+        device=parameter.device,
+        dtype=parameter.dtype,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=prefetch_frames,
+        validated_indexes=validated_indexes,
+    )
+    for index, frame in zip(indexes, frames, strict=True):
+        local = frame.local_features
+        target = frame.standardized_target
+        valid = frame.valid
         prediction = model(
-            frame.grid_input.to(device=parameter.device, dtype=parameter.dtype),
-            frame.positions.to(device=parameter.device, dtype=parameter.dtype),
+            frame.grid_input,
+            frame.positions,
             local,
             frame.geometry,
+            validate_inputs=not validated_indexes,
         )
         selected = torch.logical_and(valid, torch.isfinite(target).all(dim=1))
         if not torch.any(selected):
@@ -296,9 +337,24 @@ def evaluate_standardized_mse(
     statistics: hybrid.TrainingStatistics,
     *,
     device: torch.device | str,
+    dynamic_grid_cache: dict[tuple[str, str, int], torch.Tensor] | None = None,
+    wall_grid_cache: dict[Path, torch.Tensor] | None = None,
+    training_frame_cache: dict[
+        tuple[str, str, int], hybrid.TrainingFrameData
+    ] | None = None,
+    prefetch_frames: int = 0,
+    validated_indexes: bool = False,
 ) -> float | None:
     diagnostics = evaluate_standardized_mse_diagnostics(
-        model, indexes, statistics, device=device
+        model,
+        indexes,
+        statistics,
+        device=device,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=prefetch_frames,
+        validated_indexes=validated_indexes,
     )
     return diagnostics["frameMeanStandardizedMse"] if diagnostics else None
 
@@ -320,6 +376,15 @@ def main() -> None:
         or args.weight_decay < 0.0
     ):
         raise hybrid.ContractError("Invalid optimizer parameters.")
+    if args.prefetch_frames < 0:
+        raise hybrid.ContractError("--prefetch-frames must be non-negative.")
+    if (
+        not math.isfinite(args.dynamic_grid_cache_gib)
+        or args.dynamic_grid_cache_gib < 0.0
+        or not math.isfinite(args.training_frame_cache_gib)
+        or args.training_frame_cache_gib < 0.0
+    ):
+        raise hybrid.ContractError("Training cache sizes must be non-negative.")
 
     torch.manual_seed(args.seed)
     all_indexes = load_dataset(tuple(args.teacher))
@@ -351,7 +416,47 @@ def main() -> None:
         ),
         flush=True,
     )
-    base_statistics = hybrid.compute_base_training_statistics_streaming(indexes, split)
+    dynamic_grid_cache: dict[tuple[str, str, int], torch.Tensor] = {}
+    wall_grid_cache: dict[Path, torch.Tensor] = {}
+    training_frame_cache: dict[
+        tuple[str, str, int], hybrid.TrainingFrameData
+    ] = {}
+    cache_max_bytes = int(args.dynamic_grid_cache_gib * (1024**3))
+    frame_cache_max_bytes = int(args.training_frame_cache_gib * (1024**3))
+    preprocessing_device = args.preprocessing_device or args.device
+    base_statistics = hybrid.compute_base_training_statistics_streaming(
+        indexes,
+        split,
+        device=preprocessing_device,
+        dynamic_grid_cache=dynamic_grid_cache,
+        dynamic_grid_cache_max_bytes=cache_max_bytes,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        training_frame_cache_max_bytes=frame_cache_max_bytes,
+        prefetch_frames=args.prefetch_frames,
+    )
+    cached_bytes = sum(
+        value.numel() * value.element_size()
+        for value in dynamic_grid_cache.values()
+    )
+    cached_frame_bytes = sum(value.nbytes for value in training_frame_cache.values())
+    cached_dynamic_frame_count = len(dynamic_grid_cache)
+    cached_training_frame_count = len(training_frame_cache)
+    cached_wall_trajectory_count = len(wall_grid_cache)
+    print(
+        json.dumps(
+            {
+                "cachedDynamicGridFrames": cached_dynamic_frame_count,
+                "cachedDynamicGridGiB": cached_bytes / (1024**3),
+                "cachedFixedWallTrajectories": cached_wall_trajectory_count,
+                "cachedTrainingFrames": cached_training_frame_count,
+                "cachedTrainingFrameGiB": cached_frame_bytes / (1024**3),
+                "preprocessingDevice": preprocessing_device,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     indexes_by_split = {
         name: [
             index
@@ -389,6 +494,11 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         epoch_callback=report_epoch,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=args.prefetch_frames,
+        validated_indexes=True,
     )
     statistics = dataclasses.replace(
         base_statistics, latent=training_result.latent_statistics
@@ -398,16 +508,38 @@ def main() -> None:
         indexes_by_split["training"],
         statistics,
         device=args.device,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=args.prefetch_frames,
+        validated_indexes=True,
     )
     validation_mse = evaluate_standardized_mse(
         model,
         indexes_by_split["validation"],
         statistics,
         device=args.device,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=args.prefetch_frames,
+        validated_indexes=True,
     )
     test_mse = evaluate_standardized_mse(
-        model, indexes_by_split["test"], statistics, device=args.device
+        model,
+        indexes_by_split["test"],
+        statistics,
+        device=args.device,
+        dynamic_grid_cache=dynamic_grid_cache,
+        wall_grid_cache=wall_grid_cache,
+        training_frame_cache=training_frame_cache,
+        prefetch_frames=args.prefetch_frames,
+        validated_indexes=True,
     )
+
+    dynamic_grid_cache.clear()
+    wall_grid_cache.clear()
+    training_frame_cache.clear()
 
     hybrid.export_reference_artifacts(
         args.output,
@@ -429,6 +561,13 @@ def main() -> None:
         "learningRate": args.learning_rate,
         "weightDecay": args.weight_decay,
         "seed": args.seed,
+        "trainingDevice": args.device,
+        "preprocessingDevice": preprocessing_device,
+        "prefetchFrames": args.prefetch_frames,
+        "dynamicGridCacheGiB": cached_bytes / (1024**3),
+        "dynamicGridCachedFrames": cached_dynamic_frame_count,
+        "trainingFrameCacheGiB": cached_frame_bytes / (1024**3),
+        "trainingFrameCachedFrames": cached_training_frame_count,
         "splitFractions": list(fractions),
         "split": counts,
         "epochTrainingStandardizedMse": list(training_result.epoch_losses),

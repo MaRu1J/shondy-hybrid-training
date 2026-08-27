@@ -31,3 +31,32 @@ shondy-train-hybrid --help
 Training accepts published schema-v2 Teacher trajectories and emits the model
 bundle files required by the Runtime contract, including metadata, ONNX
 artifacts, the native particle MLP description, and exact SHA256 validation.
+
+## Training throughput
+
+The CLI fully validates every selected Teacher frame once, then trains through a
+lighter pipeline that keeps HDF5 files open, prefetches upcoming frames, and
+reuses deterministic P2G grids. These execution optimizations do not change the
+model architecture, channel contract, loss, dtype, or exported artifacts.
+
+The default host-memory limits are 8 GiB for P2G grids and 16 GiB for minimal
+training-frame tensors. Set either limit to zero to disable that cache, or lower
+the values on memory-constrained hosts:
+
+```bash
+shondy-train-hybrid teacher.h5 \
+  --output model-bundle \
+  --device cuda \
+  --preprocessing-device cuda \
+  --prefetch-frames 2 \
+  --dynamic-grid-cache-gib 8 \
+  --training-frame-cache-gib 16
+```
+
+Cache occupancy is printed before optimization starts and is recorded in
+`training-metrics.json`. Caches are released before model export.
+
+By default, the one-time P2G statistics pass uses `--device`. Set
+`--preprocessing-device cpu` to preserve the legacy CPU reduction numerics while
+keeping model training on CUDA; CUDA P2G is faster but floating-point atomic
+reduction order can produce small, contract-valid differences.

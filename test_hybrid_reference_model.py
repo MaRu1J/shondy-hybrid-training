@@ -342,6 +342,53 @@ class DataAndNormalizationTests(unittest.TestCase):
         self.assertEqual(streaming.target.count, eager.target.count)
         self.assertEqual(tuple(prepared.grid_input.shape), (1, 21, 8, 8, 8))
 
+    def test_cached_prefetched_training_frame_matches_full_contract_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="shondy-hybrid-cache-") as directory:
+            path = Path(directory) / "teacher.h5"
+            write_teacher_file(path)
+            indexes = hybrid.index_teacher_trajectory(path)
+            split = hybrid.split_trajectories(indexes, fractions=(1.0, 0.0, 0.0))
+            dynamic_cache: dict[tuple[str, str, int], torch.Tensor] = {}
+            frame_cache: dict[
+                tuple[str, str, int], hybrid.TrainingFrameData
+            ] = {}
+            statistics = hybrid.compute_base_training_statistics_streaming(
+                indexes,
+                split,
+                device="cpu",
+                dynamic_grid_cache=dynamic_cache,
+                dynamic_grid_cache_max_bytes=1024**2,
+                training_frame_cache=frame_cache,
+                training_frame_cache_max_bytes=1024**2,
+                prefetch_frames=1,
+            )
+            expected = hybrid.prepare_indexed_frame(indexes[0], statistics)
+            actual = next(
+                hybrid.iter_prepared_training_frames(
+                    indexes,
+                    statistics,
+                    device="cpu",
+                    dtype=torch.float64,
+                    dynamic_grid_cache=dynamic_cache,
+                    training_frame_cache=frame_cache,
+                    prefetch_frames=2,
+                    validated_indexes=True,
+                )
+            )
+
+        self.assertEqual(set(dynamic_cache), {indexes[0].frame_key})
+        self.assertEqual(set(frame_cache), {indexes[0].frame_key})
+        self.assertEqual(actual.frame_key, expected.frame_key)
+        torch.testing.assert_close(actual.grid_input, expected.grid_input)
+        torch.testing.assert_close(actual.positions, expected.positions)
+        torch.testing.assert_close(actual.local_features, expected.local_features)
+        torch.testing.assert_close(
+            actual.standardized_target,
+            expected.standardized_target,
+            equal_nan=True,
+        )
+        torch.testing.assert_close(actual.valid, expected.valid)
+
     def test_evenly_spaced_frame_subset_is_deterministic_and_includes_ends(
         self,
     ) -> None:
