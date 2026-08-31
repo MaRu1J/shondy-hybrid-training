@@ -5,7 +5,7 @@ image is pinned by digest and Python dependencies are pinned in
 `requirements-cuda12.8.lock`, including the transitive dependency closure.
 The image installs that closure with `--no-deps` and runs `pip check`, so pip
 cannot silently resolve newer transitive packages. The contract is installed
-as the released `shondy-hybrid-contract==1.0.0` wheel from the configured
+as the released `shondy-hybrid-contract==2.0.0` wheel from the configured
 package index; the solver repository is not part of the build context:
 
 ```bash
@@ -24,6 +24,6 @@ particle ONNX sessions with `session.disable_cpu_ep_fallback=1` under
 `docker run --gpus` and confirm CUDA is the first provider.
 
 The `pyproject.toml` entry point is `shondy-train-hybrid`. A developer install
-outside the container must install `shondy-hybrid-contract==1.0.0` first. Such
+outside the container must install `shondy-hybrid-contract==2.0.0` first. Such
 an install is convenient for development but is not the reproducibility
 baseline.

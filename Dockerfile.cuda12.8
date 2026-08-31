@@ -16,7 +16,7 @@ COPY requirements-cuda12.8.lock /tmp/requirements.lock
 RUN python3 -m pip install --break-system-packages --no-deps -r /tmp/requirements.lock
 
 RUN python3 -m pip install --break-system-packages --no-deps \
-    shondy-hybrid-contract==1.0.0 \
+    shondy-hybrid-contract==2.0.0 \
     && python3 -m pip check
 
 COPY . /opt/shondy/training

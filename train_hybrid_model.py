@@ -6,8 +6,10 @@ import argparse
 import dataclasses
 import json
 import math
+import sys
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import torch
 
@@ -22,10 +24,15 @@ def parse_arguments() -> argparse.Namespace:
         "teacher",
         nargs="+",
         type=Path,
-        help="One or more published schema-v2 Teacher HDF5 trajectories.",
+        help="One or more published Schema 3 Teacher HDF5 trajectories.",
     )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--model-profile",
+        choices=tuple(hybrid.MODEL_PROFILES),
+        default=hybrid.DEFAULT_MODEL_PROFILE,
+    )
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
@@ -42,6 +49,12 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=2,
         help="Validated Teacher frames to load ahead while the device is training.",
+    )
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=1.0,
+        help="Maximum interval between non-interactive epoch progress updates.",
     )
     parser.add_argument(
         "--dynamic-grid-cache-gib",
@@ -69,6 +82,11 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=(),
         help="Epochs at which to save CPU model-state checkpoints.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        help="Restore a profile-checked model-state checkpoint before training.",
     )
     parser.add_argument(
         "--split-fractions",
@@ -143,10 +161,36 @@ def _write_checkpoint(
         {
             "epoch": epoch,
             "trainingStandardizedMse": training_loss,
+            "modelProfile": model.model_profile,
+            "architecture": hybrid.model_architecture(model),
             "modelState": state,
         },
         path,
     )
+
+
+def _load_checkpoint(path: Path, model: hybrid.HybridReferenceModel) -> dict[str, Any]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise hybrid.ContractError("Checkpoint must contain an object.")
+    if checkpoint.get("modelProfile") != model.model_profile:
+        raise hybrid.ContractError(
+            "Checkpoint model profile does not match CLI profile."
+        )
+    if checkpoint.get("architecture") != hybrid.model_architecture(model):
+        raise hybrid.ContractError("Checkpoint architecture metadata is inconsistent.")
+    state = checkpoint.get("modelState")
+    if not isinstance(state, dict):
+        raise hybrid.ContractError("Checkpoint is missing modelState.")
+    expected = model.state_dict()
+    if set(state) != set(expected) or any(
+        not isinstance(state[name], torch.Tensor)
+        or state[name].shape != expected[name].shape
+        for name in expected
+    ):
+        raise hybrid.ContractError("Checkpoint tensor shapes do not match its profile.")
+    model.load_state_dict(state, strict=True)
+    return checkpoint
 
 
 def _split_counts(
@@ -162,6 +206,77 @@ def _split_counts(
     return result
 
 
+class EpochProgressReporter:
+    def __init__(
+        self,
+        epoch_count: int,
+        interval_seconds: float,
+        *,
+        stream: TextIO = sys.stderr,
+    ) -> None:
+        if (
+            epoch_count <= 0
+            or not math.isfinite(interval_seconds)
+            or interval_seconds <= 0.0
+        ):
+            raise hybrid.ContractError("Progress reporting values must be positive.")
+        self.epoch_count = epoch_count
+        self.interval_seconds = interval_seconds
+        self.stream = stream
+        self.interactive = stream.isatty()
+        self.current_epoch = 0
+        self.epoch_started = 0.0
+        self.last_reported = 0.0
+
+    def __call__(self, epoch: int, completed: int, total: int) -> None:
+        if total <= 0 or completed < 0 or completed > total:
+            raise hybrid.ContractError("Invalid epoch progress counters.")
+        now = time.perf_counter()
+        if epoch != self.current_epoch:
+            self.current_epoch = epoch
+            self.epoch_started = now
+            self.last_reported = 0.0
+        if (
+            not self.interactive
+            and completed not in (0, total)
+            and now - self.last_reported < self.interval_seconds
+        ):
+            return
+        elapsed = max(0.0, now - self.epoch_started)
+        fraction = completed / total
+        eta = elapsed * (total - completed) / completed if completed else None
+        if self.interactive:
+            width = 30
+            filled = min(width, int(fraction * width))
+            bar = "#" * filled + "." * (width - filled)
+            eta_text = f"{eta:7.1f}s" if eta is not None else "   --.-s"
+            self.stream.write(
+                f"\rEpoch {epoch}/{self.epoch_count} [{bar}] "
+                f"{completed}/{total} {100.0 * fraction:6.2f}% "
+                f"elapsed {elapsed:7.1f}s ETA {eta_text}"
+            )
+            if completed == total:
+                self.stream.write("\n")
+            self.stream.flush()
+        else:
+            print(
+                json.dumps(
+                    {
+                        "epoch": epoch,
+                        "progressFrames": completed,
+                        "totalFrames": total,
+                        "progressFraction": fraction,
+                        "elapsedSeconds": elapsed,
+                        "etaSeconds": eta,
+                    },
+                    sort_keys=True,
+                ),
+                file=self.stream,
+                flush=True,
+            )
+        self.last_reported = now
+
+
 @torch.no_grad()
 def evaluate_standardized_mse_diagnostics(
     model: hybrid.HybridReferenceModel,
@@ -171,9 +286,8 @@ def evaluate_standardized_mse_diagnostics(
     device: torch.device | str,
     dynamic_grid_cache: dict[tuple[str, str, int], torch.Tensor] | None = None,
     wall_grid_cache: dict[Path, torch.Tensor] | None = None,
-    training_frame_cache: dict[
-        tuple[str, str, int], hybrid.TrainingFrameData
-    ] | None = None,
+    training_frame_cache: dict[tuple[str, str, int], hybrid.TrainingFrameData]
+    | None = None,
     prefetch_frames: int = 0,
     validated_indexes: bool = False,
 ) -> dict[str, Any] | None:
@@ -339,9 +453,8 @@ def evaluate_standardized_mse(
     device: torch.device | str,
     dynamic_grid_cache: dict[tuple[str, str, int], torch.Tensor] | None = None,
     wall_grid_cache: dict[Path, torch.Tensor] | None = None,
-    training_frame_cache: dict[
-        tuple[str, str, int], hybrid.TrainingFrameData
-    ] | None = None,
+    training_frame_cache: dict[tuple[str, str, int], hybrid.TrainingFrameData]
+    | None = None,
     prefetch_frames: int = 0,
     validated_indexes: bool = False,
 ) -> float | None:
@@ -379,12 +492,26 @@ def main() -> None:
     if args.prefetch_frames < 0:
         raise hybrid.ContractError("--prefetch-frames must be non-negative.")
     if (
+        not math.isfinite(args.progress_interval_seconds)
+        or args.progress_interval_seconds <= 0.0
+    ):
+        raise hybrid.ContractError(
+            "--progress-interval-seconds must be finite and positive."
+        )
+    if (
         not math.isfinite(args.dynamic_grid_cache_gib)
         or args.dynamic_grid_cache_gib < 0.0
         or not math.isfinite(args.training_frame_cache_gib)
         or args.training_frame_cache_gib < 0.0
     ):
         raise hybrid.ContractError("Training cache sizes must be non-negative.")
+    if args.output.exists() and (
+        not args.output.is_dir() or any(args.output.iterdir())
+    ):
+        raise hybrid.ContractError(
+            "--output must be a new directory or an existing empty directory."
+        )
+    args.output.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(args.seed)
     all_indexes = load_dataset(tuple(args.teacher))
@@ -418,9 +545,7 @@ def main() -> None:
     )
     dynamic_grid_cache: dict[tuple[str, str, int], torch.Tensor] = {}
     wall_grid_cache: dict[Path, torch.Tensor] = {}
-    training_frame_cache: dict[
-        tuple[str, str, int], hybrid.TrainingFrameData
-    ] = {}
+    training_frame_cache: dict[tuple[str, str, int], hybrid.TrainingFrameData] = {}
     cache_max_bytes = int(args.dynamic_grid_cache_gib * (1024**3))
     frame_cache_max_bytes = int(args.training_frame_cache_gib * (1024**3))
     preprocessing_device = args.preprocessing_device or args.device
@@ -436,8 +561,7 @@ def main() -> None:
         prefetch_frames=args.prefetch_frames,
     )
     cached_bytes = sum(
-        value.numel() * value.element_size()
-        for value in dynamic_grid_cache.values()
+        value.numel() * value.element_size() for value in dynamic_grid_cache.values()
     )
     cached_frame_bytes = sum(value.nbytes for value in training_frame_cache.values())
     cached_dynamic_frame_count = len(dynamic_grid_cache)
@@ -466,13 +590,30 @@ def main() -> None:
         for name in ("training", "validation", "test")
     }
     model = hybrid.HybridReferenceModel(
-        condition_count=len(indexes[0].condition_names)
+        condition_count=len(indexes[0].condition_names),
+        model_profile=args.model_profile,
     ).to(dtype=torch.float32)
-    args.output.mkdir(parents=True, exist_ok=True)
+    resumed_checkpoint = (
+        _load_checkpoint(args.resume_checkpoint, model)
+        if args.resume_checkpoint is not None
+        else None
+    )
+    training_device = torch.device(args.device)
+    if training_device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(training_device)
+    progress_reporter = EpochProgressReporter(
+        args.epochs, args.progress_interval_seconds
+    )
 
-    def report_epoch(epoch: int, loss: float) -> None:
+    def report_epoch(epoch: int, loss: float, elapsed: float) -> None:
         print(
-            json.dumps({"epoch": epoch, "trainingStandardizedMse": loss}),
+            json.dumps(
+                {
+                    "epoch": epoch,
+                    "trainingStandardizedMse": loss,
+                    "epochSeconds": elapsed,
+                }
+            ),
             flush=True,
         )
         if epoch in checkpoint_epochs:
@@ -494,11 +635,17 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         epoch_callback=report_epoch,
+        progress_callback=progress_reporter,
         dynamic_grid_cache=dynamic_grid_cache,
         wall_grid_cache=wall_grid_cache,
         training_frame_cache=training_frame_cache,
         prefetch_frames=args.prefetch_frames,
         validated_indexes=True,
+    )
+    training_peak_gpu_memory = (
+        int(torch.cuda.max_memory_allocated(training_device))
+        if training_device.type == "cuda"
+        else None
     )
     statistics = dataclasses.replace(
         base_statistics, latent=training_result.latent_statistics
@@ -550,7 +697,19 @@ def main() -> None:
         collision_post_process=args.collision_post_process,
         validate_cuda=not args.skip_cuda_export_validation,
     )
-    torch.save(model.to(device="cpu").state_dict(), args.output / "model-state.pt")
+    model.to(device="cpu")
+    torch.save(
+        {
+            "modelProfile": model.model_profile,
+            "architecture": hybrid.model_architecture(model),
+            "modelState": model.state_dict(),
+        },
+        args.output / "model-state.pt",
+    )
+    export_validation = json.loads(
+        (args.output / "export-validation.json").read_text(encoding="ascii")
+    )
+    architecture = hybrid.model_architecture(model)
     metrics = {
         "teacherFiles": [str(path.resolve()) for path in args.teacher],
         "availableFrames": len(all_indexes),
@@ -558,12 +717,29 @@ def main() -> None:
         "frameSubsetCount": args.frame_subset_count,
         "checkpointEpochs": list(checkpoint_epochs),
         "epochs": args.epochs,
+        "modelProfile": model.model_profile,
+        "architecture": architecture,
+        "conditionWidth": len(indexes[0].condition_names),
+        "aiDeltaTime": indexes[0].ai_delta_time,
+        "contractVersion": hybrid.CONTRACT["contractPackage"]["version"],
+        "teacherSchemaVersion": hybrid.TEACHER_SCHEMA_VERSION,
+        "modelBundleSchemaVersion": hybrid.MODEL_BUNDLE_SCHEMA_VERSION,
+        "wallRasterizationAlgorithm": hybrid.RASTERIZATION_ALGORITHM_VERSION,
         "learningRate": args.learning_rate,
         "weightDecay": args.weight_decay,
+        "optimizer": "AdamW",
+        "learningRateSchedule": "constant",
+        "batchSizeFrames": 1,
         "seed": args.seed,
         "trainingDevice": args.device,
         "preprocessingDevice": preprocessing_device,
         "prefetchFrames": args.prefetch_frames,
+        "progressIntervalSeconds": args.progress_interval_seconds,
+        "workerConfiguration": {
+            "hdf5PrefetchThreadCount": int(args.prefetch_frames > 0),
+            "prefetchFrames": args.prefetch_frames,
+        },
+        "dataOrder": "sorted-frame-key-then-seeded-epoch-shuffle",
         "dynamicGridCacheGiB": cached_bytes / (1024**3),
         "dynamicGridCachedFrames": cached_dynamic_frame_count,
         "trainingFrameCacheGiB": cached_frame_bytes / (1024**3),
@@ -571,6 +747,18 @@ def main() -> None:
         "splitFractions": list(fractions),
         "split": counts,
         "epochTrainingStandardizedMse": list(training_result.epoch_losses),
+        "epochSeconds": list(training_result.epoch_seconds),
+        "averageEpochSeconds": sum(training_result.epoch_seconds)
+        / len(training_result.epoch_seconds),
+        "peakGpuMemoryBytes": training_peak_gpu_memory,
+        "resumeCheckpoint": (
+            str(args.resume_checkpoint.resolve())
+            if args.resume_checkpoint is not None
+            else None
+        ),
+        "resumedCheckpointEpoch": (
+            resumed_checkpoint.get("epoch") if resumed_checkpoint is not None else None
+        ),
         "finalTrainingStandardizedMse": (
             training_diagnostics["frameMeanStandardizedMse"]
             if training_diagnostics
@@ -579,6 +767,8 @@ def main() -> None:
         "trainingDiagnostics": training_diagnostics,
         "validationStandardizedMse": validation_mse,
         "testStandardizedMse": test_mse,
+        "inferenceExportSucceeded": True,
+        "exportValidation": export_validation,
     }
     _write_metrics(args.output / "training-metrics.json", metrics)
     print(json.dumps({"artifacts": str(args.output.resolve())}), flush=True)

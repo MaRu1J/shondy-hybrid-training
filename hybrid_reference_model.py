@@ -11,6 +11,7 @@ import queue
 import random
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,20 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-from shondy_hybrid_contract import CONTRACT, REGISTRY_SHA256, validate_model_bundle
+from shondy_hybrid_contract import CONTRACT_V2 as CONTRACT
+from shondy_hybrid_contract import REGISTRY_V2_SHA256 as REGISTRY_SHA256
+from shondy_hybrid_contract import validate_model_bundle_v3
+
+from wall_rasterizer import (
+    RASTERIZATION_ALGORITHM_VERSION,
+    ResolvedWallState,
+    WallContractError,
+    WallGeometry,
+    load_wall_geometry,
+    rasterize_wall_grid,
+    resolve_wall_states,
+    validate_frame_wall_state,
+)
 
 TEACHER_SCHEMA_VERSION = int(CONTRACT["teacher"]["schemaVersion"])
 MODEL_BUNDLE_SCHEMA_VERSION = int(CONTRACT["modelBundle"]["schemaVersion"])
@@ -43,6 +57,20 @@ PARTICLE_MLP_WIDTHS = tuple(
 )
 ONNX_CONSISTENCY_RTOL = 2.0e-2
 ONNX_CONSISTENCY_ATOL = 5.0e-2
+WALL_CACHE_RTOL = 1.0e-5
+WALL_CACHE_ATOL = 1.0e-6
+
+DEFAULT_MODEL_PROFILE = "compact-v1"
+MODEL_PROFILES: dict[str, dict[str, tuple[int, ...]]] = {
+    "compact-v1": {
+        "encoderWidths": (32, 48, 64, 96),
+        "decoderWidths": (64, 48, 32),
+    },
+    "large-v1": {
+        "encoderWidths": (64, 96, 128, 192),
+        "decoderWidths": (128, 96, 64),
+    },
+}
 
 LOCAL_FEATURE_NAMES = tuple(CONTRACT["channels"]["local"])
 DYNAMIC_QUANTITY_NAMES = tuple(CONTRACT["channels"]["dynamicQuantities"])
@@ -149,9 +177,7 @@ class GridGeometry:
         minimum = torch.tensor(
             self.padded_bounds_min, dtype=torch.float64, device=device
         )
-        spacing = torch.as_tensor(
-            self.cell_size, dtype=torch.float64, device=device
-        )
+        spacing = torch.as_tensor(self.cell_size, dtype=torch.float64, device=device)
 
         def centers(axis: int, count: int) -> torch.Tensor:
             index = torch.arange(count, dtype=torch.float64, device=device)
@@ -272,6 +298,7 @@ class TeacherFrameIndex:
     condition_names: tuple[str, ...]
     conditions: tuple[float, ...]
     particle_count: int
+    wall_is_static: bool
 
     @property
     def trajectory_key(self) -> tuple[str, str]:
@@ -459,6 +486,7 @@ type TeacherFileContract = tuple[
     GridGeometry,
     tuple[str, ...],
     tuple[float, ...],
+    WallGeometry,
 ]
 
 
@@ -491,8 +519,8 @@ def _teacher_file_contract(file: h5py.File) -> TeacherFileContract:
         _required_attribute(file, "trajectoryId"), "trajectoryId"
     )
     ai_delta_time = float(_required_attribute(file, "aiDeltaTime"))
-    if ai_delta_time != float(teacher_contract["aiDeltaTime"]):
-        raise ContractError("Published Teacher contract requires aiDeltaTime=1e-4.")
+    if not math.isfinite(ai_delta_time) or ai_delta_time <= 0.0:
+        raise ContractError("aiDeltaTime must be finite and strictly positive.")
     particle_diameter = float(_required_attribute(file, "particleDiameter"))
     if not math.isfinite(particle_diameter) or particle_diameter <= 0.0:
         raise ContractError("particleDiameter must be finite and positive.")
@@ -508,6 +536,11 @@ def _teacher_file_contract(file: h5py.File) -> TeacherFileContract:
         "macroTickDefinition": teacher_contract["macroTickDefinition"],
         "teacherFrameStrideSemantics": teacher_contract["teacherFrameStrideSemantics"],
         "gridInterpolation": grid_contract["interpolation"],
+        "coordinateTransform": CONTRACT["wall"]["coordinateTransform"],
+        "quaternionConvention": CONTRACT["wall"]["quaternionConvention"],
+        "timeInterpolation": CONTRACT["wall"]["timeInterpolation"],
+        "velocityDefinition": CONTRACT["wall"]["velocityDefinition"],
+        "wallRasterizationAlgorithm": CONTRACT["wall"]["rasterizationAlgorithm"],
     }
     for name, expected in exact_text_attributes.items():
         actual = _attribute_text(_required_attribute(file, name), name)
@@ -568,16 +601,13 @@ def _teacher_file_contract(file: h5py.File) -> TeacherFileContract:
         _required_attribute(file, "certificationProfile"), "certificationProfile"
     )
     profiles = CONTRACT["certificationProfiles"]
-    if profile not in (profiles["firstRelease"], profiles["extendedUnverified"]):
+    if profile not in tuple(profiles.values()):
         raise ContractError("Unknown Teacher certification profile.")
-    if profile == profiles["firstRelease"] and (
-        condition_names
-        or int(_required_attribute(file, "fixedWallGridDeduplicated")) != 1
-    ):
-        raise ContractError(
-            "Certified v1 profile must be fixed-wall and condition-free."
-        )
     geometry = _load_geometry(file)
+    try:
+        wall_geometry = load_wall_geometry(file)
+    except WallContractError as error:
+        raise ContractError(str(error)) from error
     if "frames" not in file or not isinstance(file["frames"], h5py.Group):
         raise ContractError("Missing /frames group.")
     return (
@@ -589,6 +619,7 @@ def _teacher_file_contract(file: h5py.File) -> TeacherFileContract:
         geometry,
         condition_names,
         conditions,
+        wall_geometry,
     )
 
 
@@ -607,6 +638,7 @@ def _index_teacher_frame(
         geometry,
         condition_names,
         conditions,
+        wall_geometry,
     ) = file_contract
     if "particle" not in group or "grid" not in group:
         raise ContractError(f"Invalid Teacher frame group: {frame_name}.")
@@ -627,7 +659,9 @@ def _index_teacher_frame(
     if not all(math.isfinite(value) for value in (time_start, time_end)):
         raise ContractError("Teacher frame times must be finite.")
     tolerance = (
-        64.0 * np.finfo(np.float64).eps * max(1.0, abs(time_end), abs(ai_delta_time))
+        64.0
+        * np.finfo(np.float64).eps
+        * max(1.0, abs(time_end), abs(macro_step_index * ai_delta_time))
     )
     if abs((time_end - time_start) - ai_delta_time) > tolerance:
         raise ContractError("Teacher frame duration must equal aiDeltaTime.")
@@ -655,12 +689,15 @@ def _index_teacher_frame(
     )
     if any(name not in particle for name in required_paths):
         raise ContractError(f"Missing particle datasets in frame {frame_name}.")
-    if (
-        "wallStart" not in group["grid"]
-        or "wallStart" not in group
-        or "wallEnd" not in group
-    ):
-        raise ContractError(f"Missing wall datasets in frame {frame_name}.")
+    for duplicate_name in ("wallStart", "wallEnd", "wallGeometry"):
+        if duplicate_name in group:
+            raise ContractError(
+                f"Frame {frame_name} repeats root wall topology in {duplicate_name}."
+            )
+    try:
+        validate_frame_wall_state(group, wall_geometry)
+    except WallContractError as error:
+        raise ContractError(str(error)) from error
     return TeacherFrameIndex(
         source_path=source_path,
         frame_name=frame_name,
@@ -678,6 +715,7 @@ def _index_teacher_frame(
         condition_names=condition_names,
         conditions=conditions,
         particle_count=int(static_id.shape[0]),
+        wall_is_static=wall_geometry.is_static,
     )
 
 
@@ -698,10 +736,29 @@ def index_teacher_trajectory(path: str | Path) -> tuple[TeacherFrameIndex, ...]:
     return indexes
 
 
+def _resolved_wall_state(states: Sequence[ResolvedWallState]) -> WallState:
+    return WallState(
+        body_uuids=tuple(state.body_uuid for state in states),
+        center_of_mass=np.stack([state.center_of_mass for state in states], axis=0)
+        if states
+        else np.empty((0, 3), dtype=np.float64),
+        rotation_wxyz=np.stack([state.rotation_wxyz for state in states], axis=0)
+        if states
+        else np.empty((0, 4), dtype=np.float64),
+        linear_velocity=np.stack([state.linear_velocity for state in states], axis=0)
+        if states
+        else np.empty((0, 3), dtype=np.float64),
+        angular_velocity=np.stack([state.angular_velocity for state in states], axis=0)
+        if states
+        else np.empty((0, 3), dtype=np.float64),
+    )
+
+
 def _load_teacher_frame_from_file(
     index: TeacherFrameIndex,
     file: h5py.File,
     file_contract: TeacherFileContract,
+    wall_channels: np.ndarray | None = None,
 ) -> TeacherFrame:
     current_index = _index_teacher_frame(
         index.source_path,
@@ -716,6 +773,29 @@ def _load_teacher_frame_from_file(
     valid_raw = _required_array(particle, "valid")
     if not np.isin(valid_raw, (0, 1)).all():
         raise ContractError("Particle valid mask must contain only 0 or 1.")
+    wall_geometry = file_contract[-1]
+    try:
+        if wall_channels is None:
+            wall_channels = rasterize_wall_grid(file, wall_geometry, index.time_start)
+        start_states = resolve_wall_states(file, wall_geometry, index.time_start)
+        end_states = resolve_wall_states(file, wall_geometry, index.time_end)
+    except WallContractError as error:
+        raise ContractError(str(error)) from error
+    if "wallStart" in group["grid"]:
+        cached_wall = _required_array(group["grid"], "wallStart")
+        if (
+            cached_wall.shape != wall_channels.shape
+            or cached_wall.dtype != np.float32
+            or not np.allclose(
+                cached_wall,
+                wall_channels,
+                rtol=WALL_CACHE_RTOL,
+                atol=WALL_CACHE_ATOL,
+            )
+        ):
+            raise ContractError(
+                "Optional dense wallStart cache disagrees with Schema 3 reconstruction."
+            )
     frame = TeacherFrame(
         source_path=index.source_path,
         case_id=index.case_id,
@@ -745,9 +825,9 @@ def _load_teacher_frame_from_file(
             particle, "targetResidualAcceleration"
         ),
         valid=valid_raw.astype(np.bool_),
-        wall_start=_load_wall_state(group["wallStart"]),
-        wall_end=_load_wall_state(group["wallEnd"]),
-        wall_channels_start=_required_array(group["grid"], "wallStart"),
+        wall_start=_resolved_wall_state(start_states),
+        wall_end=_resolved_wall_state(end_states),
+        wall_channels_start=wall_channels,
     )
     _validate_particle_arrays(frame)
     if not np.allclose(
@@ -773,10 +853,9 @@ class _TeacherFrameReader:
     def __init__(self) -> None:
         self._files: dict[Path, h5py.File] = {}
         self._contracts: dict[Path, TeacherFileContract] = {}
+        self._static_wall_grids: dict[Path, np.ndarray] = {}
 
-    def _file(
-        self, index: TeacherFrameIndex
-    ) -> tuple[h5py.File, TeacherFileContract]:
+    def _file(self, index: TeacherFrameIndex) -> tuple[h5py.File, TeacherFileContract]:
         path = index.source_path
         if path not in self._files:
             file = h5py.File(path, "r")
@@ -791,7 +870,25 @@ class _TeacherFrameReader:
 
     def load_validated(self, index: TeacherFrameIndex) -> TeacherFrame:
         file, contract = self._file(index)
-        return _load_teacher_frame_from_file(index, file, contract)
+        return _load_teacher_frame_from_file(
+            index, file, contract, self._wall_grid(index, file, contract)
+        )
+
+    def _wall_grid(
+        self,
+        index: TeacherFrameIndex,
+        file: h5py.File,
+        contract: TeacherFileContract,
+    ) -> np.ndarray:
+        if index.wall_is_static and index.source_path in self._static_wall_grids:
+            return self._static_wall_grids[index.source_path]
+        try:
+            wall = rasterize_wall_grid(file, contract[-1], index.time_start)
+        except WallContractError as error:
+            raise ContractError(str(error)) from error
+        if index.wall_is_static:
+            self._static_wall_grids[index.source_path] = wall
+        return wall
 
     def load_training(
         self,
@@ -812,9 +909,10 @@ class _TeacherFrameReader:
         group = file["frames"][index.frame_name]
         particle = group["particle"]
         valid_raw = _required_array(particle, "valid")
-        if valid_raw.shape != (index.particle_count,) or not np.isin(
-            valid_raw, (0, 1)
-        ).all():
+        if (
+            valid_raw.shape != (index.particle_count,)
+            or not np.isin(valid_raw, (0, 1)).all()
+        ):
             raise ContractError("Particle valid mask must contain only 0 or 1.")
         if not np.any(valid_raw):
             raise ContractError("MSE requires at least one valid finite target.")
@@ -830,7 +928,7 @@ class _TeacherFrameReader:
         radius = _required_array(particle, "radiusStart") if include_radius else None
         if radius is not None and radius.shape != (index.particle_count,):
             raise ContractError("radiusStart must have shape [P].")
-        wall = _required_array(group["grid"], "wallStart") if include_wall else None
+        wall = self._wall_grid(index, file, contract) if include_wall else None
         if wall is not None and wall.shape != (
             WALL_GRID_CHANNEL_COUNT,
             *index.geometry.tensor_shape,
@@ -868,6 +966,7 @@ class _TeacherFrameReader:
             file.close()
         self._files.clear()
         self._contracts.clear()
+        self._static_wall_grids.clear()
 
     def __enter__(self) -> Self:
         return self
@@ -1210,7 +1309,6 @@ class FeatureStatistics:
             "std": self.std.detach().cpu().tolist(),
             "count": self.count,
             "constantMask": self.constant_mask.detach().cpu().tolist(),
-            "constantConvention": "std=1",
         }
 
 
@@ -1316,11 +1414,9 @@ def validate_wall_channels(wall_channels: torch.Tensor, geometry: GridGeometry) 
     outside = wall_band <= 0.0
     if torch.any(wall_channels[1:7, outside] != 0.0):
         raise ContractError("Wall normal and velocity must be zero outside wallBand.")
-    expected_mask = geometry.valid_domain_mask(
-        dtype=wall_channels.dtype, device=wall_channels.device
-    )[0]
+    expected_mask = (wall_band <= 0.0).to(dtype=wall_channels.dtype)
     if not torch.equal(wall_channels[7], expected_mask):
-        raise ContractError("validDomainMask does not match physical bounds.")
+        raise ContractError("validDomainMask must be one outside the wall band.")
 
 
 def assemble_grid_input(
@@ -1433,9 +1529,7 @@ def _training_data_tensors(
 ) -> dict[str, torch.Tensor]:
     if dtype is None:
         dtype = (
-            torch.float64
-            if frame.position_start.dtype == np.float64
-            else torch.float32
+            torch.float64 if frame.position_start.dtype == np.float64 else torch.float32
         )
 
     def transfer(value: np.ndarray, *, tensor_dtype: torch.dtype) -> torch.Tensor:
@@ -1544,14 +1638,12 @@ def compute_base_training_statistics_streaming(
     split: TrajectorySplit,
     *,
     device: torch.device | str = "cpu",
-    dynamic_grid_cache: MutableMapping[
-        tuple[str, str, int], torch.Tensor
-    ] | None = None,
+    dynamic_grid_cache: MutableMapping[tuple[str, str, int], torch.Tensor]
+    | None = None,
     dynamic_grid_cache_max_bytes: int = 0,
     wall_grid_cache: MutableMapping[Path, torch.Tensor] | None = None,
-    training_frame_cache: MutableMapping[
-        tuple[str, str, int], TrainingFrameData
-    ] | None = None,
+    training_frame_cache: MutableMapping[tuple[str, str, int], TrainingFrameData]
+    | None = None,
     training_frame_cache_max_bytes: int = 0,
     prefetch_frames: int = 0,
 ) -> TrainingStatistics:
@@ -1573,10 +1665,14 @@ def compute_base_training_statistics_streaming(
     ]
     indexes_by_key = {index.frame_key: index for index in selected_indexes}
     accepted = 0
-    cached_bytes = sum(
-        value.numel() * value.element_size()
-        for value in dynamic_grid_cache.values()
-    ) if dynamic_grid_cache is not None else 0
+    cached_bytes = (
+        sum(
+            value.numel() * value.element_size()
+            for value in dynamic_grid_cache.values()
+        )
+        if dynamic_grid_cache is not None
+        else 0
+    )
     cached_training_bytes = (
         sum(value.nbytes for value in training_frame_cache.values())
         if training_frame_cache is not None
@@ -1611,14 +1707,16 @@ def compute_base_training_statistics_streaming(
                 cached_bytes += grid_bytes
         if (
             wall_grid_cache is not None
-            and frame.certification_profile
-            == CONTRACT["certificationProfiles"]["firstRelease"]
+            and indexes_by_key[frame.frame_key].wall_is_static
             and frame.source_path not in wall_grid_cache
         ):
             wall_grid_cache[frame.source_path] = (
                 torch.as_tensor(frame.wall_channels_start).clone().contiguous()
             )
-        if training_frame_cache is not None and frame.frame_key not in training_frame_cache:
+        if (
+            training_frame_cache is not None
+            and frame.frame_key not in training_frame_cache
+        ):
             cached_frame = TrainingFrameData(
                 index=indexes_by_key[frame.frame_key],
                 position_start=frame.position_start,
@@ -1815,9 +1913,8 @@ def iter_prepared_training_frames(
     dtype: torch.dtype | None = None,
     dynamic_grid_cache: Mapping[tuple[str, str, int], torch.Tensor] | None = None,
     wall_grid_cache: Mapping[Path, torch.Tensor] | None = None,
-    training_frame_cache: Mapping[
-        tuple[str, str, int], TrainingFrameData
-    ] | None = None,
+    training_frame_cache: Mapping[tuple[str, str, int], TrainingFrameData]
+    | None = None,
     prefetch_frames: int = 0,
     validated_indexes: bool = False,
 ) -> Iterable[PreparedFrame]:
@@ -2017,22 +2114,34 @@ class UpStage3d(torch.nn.Module):
         return self.block(torch.cat((value, skip), dim=1))
 
 
-class CompactGridEncoder(torch.nn.Module):
-    """Frozen 32/48/64/96 compact 3D U-Net with a linear 16D head."""
+class ProfiledGridEncoder(torch.nn.Module):
+    """Profile-selected 3D U-Net with an explicit linear 16-channel head."""
 
-    def __init__(self, input_channels: int) -> None:
+    def __init__(self, input_channels: int, model_profile: str) -> None:
         super().__init__()
         if input_channels < BASE_GRID_CHANNEL_COUNT:
             raise ContractError("Grid encoder requires at least 19 input channels.")
+        if model_profile not in MODEL_PROFILES:
+            raise ContractError(f"Unknown model profile: {model_profile}.")
+        profile = MODEL_PROFILES[model_profile]
+        encoder = profile["encoderWidths"]
+        decoder = profile["decoderWidths"]
+        if len(encoder) != 4 or len(decoder) != 3:
+            raise ContractError(
+                "Grid encoder profile must define four down and three up widths."
+            )
         self.input_channels = input_channels
-        self.full = DoubleConv3d(input_channels, 32)
-        self.down_half = DownStage3d(32, 48)
-        self.down_quarter = DownStage3d(48, 64)
-        self.down_eighth = DownStage3d(64, 96)
-        self.up_quarter = UpStage3d(96, 64, 64)
-        self.up_half = UpStage3d(64, 48, 48)
-        self.up_full = UpStage3d(48, 32, 32)
-        self.output = torch.nn.Conv3d(32, LATENT_CHANNEL_COUNT, 1)
+        self.model_profile = model_profile
+        self.encoder_widths = encoder
+        self.decoder_widths = decoder
+        self.full = DoubleConv3d(input_channels, encoder[0])
+        self.down_half = DownStage3d(encoder[0], encoder[1])
+        self.down_quarter = DownStage3d(encoder[1], encoder[2])
+        self.down_eighth = DownStage3d(encoder[2], encoder[3])
+        self.up_quarter = UpStage3d(encoder[3], encoder[2], decoder[0])
+        self.up_half = UpStage3d(decoder[0], encoder[1], decoder[1])
+        self.up_full = UpStage3d(decoder[1], encoder[0], decoder[2])
+        self.output = torch.nn.Conv3d(decoder[2], LATENT_CHANNEL_COUNT, 1)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         if value.ndim != 5 or value.shape[1] != self.input_channels:
@@ -2057,6 +2166,16 @@ class CompactGridEncoder(torch.nn.Module):
         ].contiguous()
 
 
+class CompactGridEncoder(ProfiledGridEncoder):
+    def __init__(self, input_channels: int) -> None:
+        super().__init__(input_channels, "compact-v1")
+
+
+class LargeGridEncoder(ProfiledGridEncoder):
+    def __init__(self, input_channels: int) -> None:
+        super().__init__(input_channels, "large-v1")
+
+
 class ParticleMLP(torch.nn.Module):
     """Frozen 34 -> 128 -> 128 -> 64 -> 3 particle branch."""
 
@@ -2077,13 +2196,20 @@ class ParticleMLP(torch.nn.Module):
 
 
 class HybridReferenceModel(torch.nn.Module):
-    def __init__(self, condition_count: int) -> None:
+    def __init__(
+        self,
+        condition_count: int,
+        model_profile: str = DEFAULT_MODEL_PROFILE,
+    ) -> None:
         super().__init__()
         if condition_count < 0:
             raise ContractError("condition_count must be non-negative.")
+        if model_profile not in MODEL_PROFILES:
+            raise ContractError(f"Unknown model profile: {model_profile}.")
         self.condition_count = condition_count
-        self.grid_encoder = CompactGridEncoder(
-            BASE_GRID_CHANNEL_COUNT + condition_count
+        self.model_profile = model_profile
+        self.grid_encoder = ProfiledGridEncoder(
+            BASE_GRID_CHANNEL_COUNT + condition_count, model_profile
         )
         self.particle_mlp = ParticleMLP()
         self.register_buffer("latent_mean", torch.zeros(LATENT_CHANNEL_COUNT))
@@ -2113,6 +2239,34 @@ class HybridReferenceModel(torch.nn.Module):
             grid_latent, positions, geometry, validate=validate_inputs
         )
         return self.particle_mlp(torch.cat((local_features, particle_latent), dim=1))
+
+
+def model_parameter_counts(model: HybridReferenceModel) -> dict[str, int]:
+    grid_count = sum(parameter.numel() for parameter in model.grid_encoder.parameters())
+    particle_count = sum(
+        parameter.numel() for parameter in model.particle_mlp.parameters()
+    )
+    return {
+        "grid": grid_count,
+        "particleMlp": particle_count,
+        "total": grid_count + particle_count,
+    }
+
+
+def model_architecture(model: HybridReferenceModel) -> dict[str, object]:
+    counts = model_parameter_counts(model)
+    profile = MODEL_PROFILES[model.model_profile]
+    return {
+        "modelProfile": model.model_profile,
+        "gridEncoderWidths": list(profile["encoderWidths"]),
+        "decoderWidths": list(profile["decoderWidths"]),
+        "latentWidth": LATENT_CHANNEL_COUNT,
+        "particleMlpWidths": list(PARTICLE_MLP_WIDTHS),
+        "conditionWidth": model.condition_count,
+        "gridParameterCount": counts["grid"],
+        "particleMlpParameterCount": counts["particleMlp"],
+        "totalParameterCount": counts["total"],
+    }
 
 
 def standardized_target_mse(
@@ -2216,9 +2370,8 @@ def compute_particle_latent_statistics_streaming(
     *,
     dynamic_grid_cache: Mapping[tuple[str, str, int], torch.Tensor] | None = None,
     wall_grid_cache: Mapping[Path, torch.Tensor] | None = None,
-    training_frame_cache: Mapping[
-        tuple[str, str, int], TrainingFrameData
-    ] | None = None,
+    training_frame_cache: Mapping[tuple[str, str, int], TrainingFrameData]
+    | None = None,
     prefetch_frames: int = 0,
     validated_indexes: bool = False,
 ) -> FeatureStatistics:
@@ -2295,6 +2448,7 @@ def calibrate_latent_standardization(
 class TrainingResult:
     epoch_losses: tuple[float, ...]
     latent_statistics: FeatureStatistics
+    epoch_seconds: tuple[float, ...]
 
 
 def train_reference_model(
@@ -2306,7 +2460,8 @@ def train_reference_model(
     learning_rate: float,
     weight_decay: float = 0.0,
     device: torch.device | str = "cuda",
-    epoch_callback: Callable[[int, float], None] | None = None,
+    epoch_callback: Callable[[int, float, float], None] | None = None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> TrainingResult:
     """Jointly train the reference encoder and MLP one complete frame at a time."""
 
@@ -2324,11 +2479,17 @@ def train_reference_model(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
     history: list[float] = []
+    epoch_seconds: list[float] = []
     for epoch_index in range(epochs):
         model.train()
+        parameter = next(model.parameters())
+        if progress_callback is not None:
+            progress_callback(epoch_index + 1, 0, len(training_frames))
+        if parameter.device.type == "cuda":
+            torch.cuda.synchronize(parameter.device)
+        epoch_started = time.perf_counter()
         loss_sum = 0.0
-        for frame in training_frames:
-            parameter = next(model.parameters())
+        for frame_number, frame in enumerate(training_frames, start=1):
             grid_input = frame.grid_input.to(
                 device=parameter.device, dtype=parameter.dtype
             )
@@ -2348,13 +2509,19 @@ def train_reference_model(
             loss.backward()
             optimizer.step()
             loss_sum += float(loss.detach().cpu())
+            if progress_callback is not None:
+                progress_callback(epoch_index + 1, frame_number, len(training_frames))
+        if parameter.device.type == "cuda":
+            torch.cuda.synchronize(parameter.device)
+        elapsed = time.perf_counter() - epoch_started
         epoch_loss = loss_sum / len(training_frames)
         history.append(epoch_loss)
+        epoch_seconds.append(elapsed)
         if epoch_callback is not None:
-            epoch_callback(epoch_index + 1, epoch_loss)
+            epoch_callback(epoch_index + 1, epoch_loss, elapsed)
     final_latent = compute_particle_latent_statistics(model, training_frames, split)
     calibrate_latent_standardization(model, final_latent)
-    return TrainingResult(tuple(history), final_latent)
+    return TrainingResult(tuple(history), final_latent, tuple(epoch_seconds))
 
 
 def train_reference_model_streaming(
@@ -2368,12 +2535,12 @@ def train_reference_model_streaming(
     weight_decay: float = 0.0,
     device: torch.device | str = "cuda",
     seed: int = 1729,
-    epoch_callback: Callable[[int, float], None] | None = None,
+    epoch_callback: Callable[[int, float, float], None] | None = None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
     dynamic_grid_cache: Mapping[tuple[str, str, int], torch.Tensor] | None = None,
     wall_grid_cache: Mapping[Path, torch.Tensor] | None = None,
-    training_frame_cache: Mapping[
-        tuple[str, str, int], TrainingFrameData
-    ] | None = None,
+    training_frame_cache: Mapping[tuple[str, str, int], TrainingFrameData]
+    | None = None,
     prefetch_frames: int = 0,
     validated_indexes: bool = False,
 ) -> TrainingResult:
@@ -2411,12 +2578,18 @@ def train_reference_model_streaming(
     random_generator = random.Random(seed)
     order = sorted(valid_indexes, key=lambda index: index.frame_key)
     history: list[float] = []
+    epoch_seconds: list[float] = []
     for epoch_index in range(epochs):
         model.train()
         random_generator.shuffle(order)
         parameter = next(model.parameters())
+        if progress_callback is not None:
+            progress_callback(epoch_index + 1, 0, len(order))
+        if parameter.device.type == "cuda":
+            torch.cuda.synchronize(parameter.device)
+        epoch_started = time.perf_counter()
         loss_sum = torch.zeros((), dtype=torch.float64, device=parameter.device)
-        for frame in iter_prepared_training_frames(
+        prepared_frames = iter_prepared_training_frames(
             order,
             statistics,
             device=parameter.device,
@@ -2426,7 +2599,8 @@ def train_reference_model_streaming(
             training_frame_cache=training_frame_cache,
             prefetch_frames=prefetch_frames,
             validated_indexes=validated_indexes,
-        ):
+        )
+        for frame_number, frame in enumerate(prepared_frames, start=1):
             optimizer.zero_grad(set_to_none=True)
             prediction = model(
                 frame.grid_input,
@@ -2444,10 +2618,16 @@ def train_reference_model_streaming(
             loss.backward()
             optimizer.step()
             loss_sum.add_(loss.detach().to(dtype=torch.float64))
+            if progress_callback is not None:
+                progress_callback(epoch_index + 1, frame_number, len(order))
+        if parameter.device.type == "cuda":
+            torch.cuda.synchronize(parameter.device)
+        elapsed = time.perf_counter() - epoch_started
         epoch_loss = float((loss_sum / len(order)).cpu())
         history.append(epoch_loss)
+        epoch_seconds.append(elapsed)
         if epoch_callback is not None:
-            epoch_callback(epoch_index + 1, epoch_loss)
+            epoch_callback(epoch_index + 1, epoch_loss, elapsed)
     final_latent = compute_particle_latent_statistics_streaming(
         model,
         valid_indexes,
@@ -2460,7 +2640,7 @@ def train_reference_model_streaming(
         validated_indexes=validated_indexes,
     )
     calibrate_latent_standardization(model, final_latent)
-    return TrainingResult(tuple(history), final_latent)
+    return TrainingResult(tuple(history), final_latent, tuple(epoch_seconds))
 
 
 class _ExportGridEncoder(torch.nn.Module):
@@ -2644,6 +2824,76 @@ def _native_particle_parameters(
     ).tolist()
 
 
+def validate_exported_model_profile(
+    bundle: str | Path, *, expected_profile: str | None = None
+) -> dict[str, object]:
+    """Cross-check profile metadata against exported trainable parameter tensors."""
+
+    bundle_path = Path(bundle)
+    metadata_path = bundle_path / "model-metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError("Model bundle metadata is not valid ASCII JSON.") from error
+    grid_metadata = metadata.get("architecture", {}).get("gridEncoder", {})
+    profile_name = grid_metadata.get("profile")
+    if profile_name not in MODEL_PROFILES:
+        raise ContractError(f"Unknown model bundle profile: {profile_name}.")
+    if expected_profile is not None and profile_name != expected_profile:
+        raise ContractError(
+            f"Model bundle profile {profile_name} does not match {expected_profile}."
+        )
+    condition_names = metadata.get("channels", {}).get("conditions", [])
+    if not isinstance(condition_names, list):
+        raise ContractError("Model bundle condition channel metadata is invalid.")
+    expected_model = HybridReferenceModel(len(condition_names), profile_name)
+    expected_architecture = model_architecture(expected_model)
+    profile = MODEL_PROFILES[profile_name]
+    if grid_metadata.get("encoderWidths") != list(profile["encoderWidths"]):
+        raise ContractError("Model profile and encoder widths disagree.")
+    if grid_metadata.get("decoderWidths") != list(profile["decoderWidths"]):
+        raise ContractError("Model profile and decoder widths disagree.")
+    if grid_metadata.get("inputChannels") != BASE_GRID_CHANNEL_COUNT + len(
+        condition_names
+    ):
+        raise ContractError("Model profile and grid input width disagree.")
+    if grid_metadata.get("outputChannels") != LATENT_CHANNEL_COUNT:
+        raise ContractError("Model profile and latent width disagree.")
+    if (
+        grid_metadata.get("parameterCount")
+        != expected_architecture["gridParameterCount"]
+    ):
+        raise ContractError("Model profile and grid parameter count disagree.")
+    grid_script_path = bundle_path / "grid-encoder.pt"
+    particle_script_path = bundle_path / "particle-mlp.pt"
+    if not grid_script_path.is_file() or not particle_script_path.is_file():
+        raise ContractError(
+            "Training bundle profile validation requires TorchScript compatibility artifacts."
+        )
+    grid_script = torch.jit.load(str(grid_script_path), map_location="cpu")
+    particle_script = torch.jit.load(str(particle_script_path), map_location="cpu")
+    actual_grid_count = sum(value.numel() for value in grid_script.parameters())
+    actual_particle_count = sum(value.numel() for value in particle_script.parameters())
+    if actual_grid_count != expected_architecture["gridParameterCount"]:
+        raise ContractError("Exported grid layers do not match the declared profile.")
+    if actual_particle_count != expected_architecture["particleMlpParameterCount"]:
+        raise ContractError("Exported Particle MLP layers do not match its ABI.")
+    native = json.loads(
+        (bundle_path / "particle-mlp-native.json").read_text(encoding="ascii")
+    )
+    if (
+        native.get("architecture") != list(PARTICLE_MLP_WIDTHS)
+        or len(native.get("parameters", []))
+        != expected_architecture["particleMlpParameterCount"]
+    ):
+        raise ContractError("Native Particle MLP artifact does not match its ABI.")
+    return {
+        **expected_architecture,
+        "actualGridParameterCount": actual_grid_count,
+        "actualParticleMlpParameterCount": actual_particle_count,
+    }
+
+
 def export_reference_artifacts(
     output_directory: str | Path,
     model: HybridReferenceModel,
@@ -2670,14 +2920,12 @@ def export_reference_artifacts(
     condition_names = frames[0].condition_names
     ai_delta_time = frames[0].ai_delta_time
     particle_diameter = frames[0].particle_diameter
-    profiles = CONTRACT["certificationProfiles"]
-    certification_profile = (
-        profiles["firstRelease"]
-        if {frame.certification_profile for frame in frames}
-        == {profiles["firstRelease"]}
-        and len({frame.trajectory_key for frame in frames}) == 1
-        else profiles["extendedUnverified"]
-    )
+    certification_profiles = {frame.certification_profile for frame in frames}
+    if len(certification_profiles) != 1:
+        raise ContractError(
+            "Schema 3 cannot represent a bundle with mixed certification profiles."
+        )
+    certification_profile = next(iter(certification_profiles))
     for frame in frames:
         split.assignment(frame)
         if (
@@ -2695,12 +2943,10 @@ def export_reference_artifacts(
                 if isinstance(frame_reference, TeacherFrame)
                 else reader.load_radii(frame_reference)
             )
-            if (
-                radii.size == 0
-                or not np.isfinite(radii).all()
-                or np.any(radii <= 0.0)
-            ):
-                raise ContractError("Teacher particle radii must be finite and positive.")
+            if radii.size == 0 or not np.isfinite(radii).all() or np.any(radii <= 0.0):
+                raise ContractError(
+                    "Teacher particle radii must be finite and positive."
+                )
             if not np.allclose(radii, radii[0], rtol=1.0e-6, atol=0.0):
                 raise ContractError(
                     "The first baseline requires one particle resolution."
@@ -2791,6 +3037,7 @@ def export_reference_artifacts(
     else:
         grid_consistency = {"status": "notRun", "reason": "validate_cuda=false"}
         particle_consistency = {"status": "notRun", "reason": "validate_cuda=false"}
+    architecture = model_architecture(export_model)
     metadata: dict[str, object] = {
         "contractName": CONTRACT["modelBundle"]["contractName"],
         "contractVersion": CONTRACT["contractPackage"]["version"],
@@ -2809,6 +3056,15 @@ def export_reference_artifacts(
             "stencilCellCount": CONTRACT["grid"]["stencilCellCount"],
             "clampOutOfBounds": CONTRACT["grid"]["clampOutOfBounds"],
         },
+        "wall": {
+            "geometryFormatVersion": CONTRACT["wall"]["geometryFormatVersion"],
+            "quaternionOrder": CONTRACT["wall"]["quaternionOrder"],
+            "quaternionConvention": CONTRACT["wall"]["quaternionConvention"],
+            "coordinateTransform": CONTRACT["wall"]["coordinateTransform"],
+            "timeInterpolation": CONTRACT["wall"]["timeInterpolation"],
+            "velocityDefinition": CONTRACT["wall"]["velocityDefinition"],
+            "rasterizationAlgorithm": RASTERIZATION_ALGORITHM_VERSION,
+        },
         "channels": {
             "gridBase": list(BASE_GRID_CHANNEL_NAMES),
             "conditions": list(condition_names),
@@ -2818,17 +3074,12 @@ def export_reference_artifacts(
         },
         "architecture": {
             "gridEncoder": {
-                "type": "compact3dUNet",
+                "profile": model.model_profile,
                 "inputChannels": BASE_GRID_CHANNEL_COUNT + len(condition_names),
-                "encoderWidths": [32, 48, 64, 96],
-                "decoderWidths": [64, 48, 32],
+                "encoderWidths": architecture["gridEncoderWidths"],
+                "decoderWidths": architecture["decoderWidths"],
                 "outputChannels": LATENT_CHANNEL_COUNT,
-                "block": "Conv3d-GroupNorm8-ReLU-Conv3d-GroupNorm8-ReLU",
-                "downsampling": "stride2Conv3d",
-                "upsampling": "trilinearInterpolation+Conv3d",
-                "padMultiple": 8,
-                "outputCrop": True,
-                "latentActivation": "none",
+                "parameterCount": architecture["gridParameterCount"],
             },
             "particleMlp": list(PARTICLE_MLP_WIDTHS),
         },
@@ -2842,69 +3093,64 @@ def export_reference_artifacts(
             ),
             "target": statistics.target.to_metadata(TARGET_CHANNEL_NAMES),
             "particleG2pLatent": statistics.latent.to_metadata(LATENT_CHANNEL_NAMES),
-            "emptyDynamicCell": "exactZeroWhenOccupancyAtMostEpsilon",
-            "occupancyEpsilon": 1.0e-12,
         },
         "target": {
             "definition": CONTRACT["teacher"]["targetDefinition"],
             "targetIncludesTeacherCollision": CONTRACT["teacher"][
                 "targetIncludesTeacherCollision"
             ],
-            "trainingCollisionPostProcess": collision_post_process,
-            "loss": "meanSquaredErrorOnStandardizedTarget",
         },
         "previousMacroResidualHistory": {
             "definition": CONTRACT["teacher"]["previousMacroResidualHistoryDefinition"],
             "initialValue": CONTRACT["teacher"]["previousMacroResidualInitialValue"],
         },
-        "splits": split.to_metadata(frames),
         "artifacts": {
             "gridEncoder": {
                 "name": grid_onnx_path.name,
                 "format": "onnx",
                 "sha256": _sha256(grid_onnx_path),
-                "output": "standardizedGridLatent16",
-                "torchscriptCompatibility": {
-                    "name": grid_path.name,
-                    "format": "torchscript",
-                    "sha256": _sha256(grid_path),
-                },
             },
             "particleMlp": {
                 "name": particle_onnx_path.name,
                 "format": "onnx",
                 "sha256": _sha256(particle_onnx_path),
-                "input": "local18+standardizedG2pLatent16",
-                "output": "physicalResidualAcceleration3",
-                "torchscriptCompatibility": {
-                    "name": particle_path.name,
-                    "format": "torchscript",
-                    "sha256": _sha256(particle_path),
-                },
             },
             "particleMlpNative": {
                 "name": particle_native_path.name,
                 "format": "json-float32-row-major-v1",
                 "sha256": _sha256(particle_native_path),
-                "input": "local18+standardizedG2pLatent16",
-                "output": "physicalResidualAcceleration3",
             },
         },
         "runtime": {
-            "pytorchVersion": torch.__version__,
             "onnxOpset": onnx_opset,
             "expectedOnnxRuntimeProvider": CONTRACT["modelBundle"][
                 "expectedOnnxRuntimeProvider"
             ],
+        },
+    }
+    _atomic_json_save(metadata, metadata_path)
+    validate_model_bundle_v3(output_directory)
+    profile_validation = validate_exported_model_profile(
+        output_directory, expected_profile=model.model_profile
+    )
+    _atomic_json_save(
+        {
+            "modelProfile": model.model_profile,
+            "collisionPostProcess": collision_post_process,
+            "pytorchVersion": torch.__version__,
+            "torchscript": {
+                "gridEncoderSha256": _sha256(grid_path),
+                "particleMlpSha256": _sha256(particle_path),
+            },
             "onnxConsistencyTolerance": {
                 "rtol": ONNX_CONSISTENCY_RTOL,
                 "atol": ONNX_CONSISTENCY_ATOL,
             },
-            "onnxArtifactsProduced": True,
             "gridEncoderConsistency": grid_consistency,
             "particleMlpConsistency": particle_consistency,
+            "profileValidation": profile_validation,
+            "contractValidator": "passed",
         },
-    }
-    _atomic_json_save(metadata, metadata_path)
-    validate_model_bundle(output_directory)
+        output_directory / "export-validation.json",
+    )
     return metadata

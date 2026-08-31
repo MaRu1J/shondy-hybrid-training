@@ -56,6 +56,18 @@ shondy-train-hybrid teacher.h5 \
 Cache occupancy is printed before optimization starts and is recorded in
 `training-metrics.json`. Caches are released before model export.
 
+## Loss curve
+
+Generate a self-contained SVG loss curve from an exported artifact bundle. The
+plotter uses only the Python standard library:
+
+```bash
+python3 plot_loss_curve.py /path/to/model-bundle
+```
+
+The default output is `/path/to/model-bundle/training-loss.svg`. Use `--output`
+to choose another SVG path.
+
 By default, the one-time P2G statistics pass uses `--device`. Set
 `--preprocessing-device cpu` to preserve the legacy CPU reduction numerics while
 keeping model training on CUDA; CUDA P2G is faster but floating-point atomic

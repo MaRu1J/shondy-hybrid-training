@@ -45,8 +45,9 @@ def make_wall_channels(
     result = torch.zeros(
         hybrid.WALL_GRID_CHANNEL_COUNT, *geometry.tensor_shape, dtype=dtype
     )
-    result[7] = geometry.valid_domain_mask(dtype=dtype, device="cpu")[0]
+    result[7] = 1.0
     result[0, 3, 3, 3] = 1.0
+    result[7, 3, 3, 3] = 0.0
     result[1, 3, 3, 3] = 1.0
     result[4, 3, 3, 3] = 2.0
     return result
@@ -57,6 +58,8 @@ def write_teacher_file(
     *,
     trajectory_id: str = "trajectory-0",
     duplicate_static_id: bool = False,
+    ai_delta_time: float = 1.0e-4,
+    motion_mode: str = "static",
 ) -> None:
     geometry = make_geometry()
     positions = np.array([[0.5, 0.5, 0.5], [1.25, 1.5, 1.75]], dtype=np.float64)
@@ -87,14 +90,19 @@ def write_teacher_file(
             [hybrid.REGISTRY_SHA256], dtype=text_type
         )
         file.attrs["schemaVersion"] = np.array([hybrid.SCHEMA_VERSION])
+        profile_key = {
+            "static": "fixedWall",
+            "prescribed-law": "prescribedWall",
+            "sampled-state": "sampledWall",
+            "coupled-state": "sampledWall",
+        }.get(motion_mode, "fixedWall")
         file.attrs["certificationProfile"] = np.array(
-            [hybrid.CONTRACT["certificationProfiles"]["extendedUnverified"]],
-            dtype=text_type,
+            [hybrid.CONTRACT["certificationProfiles"][profile_key]], dtype=text_type
         )
         file.attrs["caseId"] = np.array(["synthetic-case"], dtype=text_type)
         file.attrs["trajectoryId"] = np.array([trajectory_id], dtype=text_type)
         file.attrs["tensorLayout"] = np.array([hybrid.TENSOR_LAYOUT], dtype=text_type)
-        file.attrs["aiDeltaTime"] = np.array([1.0e-4])
+        file.attrs["aiDeltaTime"] = np.array([ai_delta_time])
         file.attrs["particleDiameter"] = np.array([1.0])
         exact_text_attributes = {
             "particleVolumeDefinition": teacher_contract["particleVolumeDefinition"],
@@ -110,6 +118,13 @@ def write_teacher_file(
                 "teacherFrameStrideSemantics"
             ],
             "gridInterpolation": grid_contract["interpolation"],
+            "coordinateTransform": hybrid.CONTRACT["wall"]["coordinateTransform"],
+            "quaternionConvention": hybrid.CONTRACT["wall"]["quaternionConvention"],
+            "timeInterpolation": hybrid.CONTRACT["wall"]["timeInterpolation"],
+            "velocityDefinition": hybrid.CONTRACT["wall"]["velocityDefinition"],
+            "wallRasterizationAlgorithm": hybrid.CONTRACT["wall"][
+                "rasterizationAlgorithm"
+            ],
         }
         for name, value in exact_text_attributes.items():
             file.attrs[name] = np.array([value], dtype=text_type)
@@ -144,7 +159,6 @@ def write_teacher_file(
                 [json.dumps(list(hybrid.CONTRACT["channels"][registry_name]))],
                 dtype=text_type,
             )
-        file.attrs["fixedWallGridDeduplicated"] = np.array([0])
         grid = file.create_group("gridGeometry")
         grid.attrs["cellCentered"] = np.array([1])
         grid.attrs["paddingCells"] = np.array([geometry.padding_cells])
@@ -153,13 +167,54 @@ def write_teacher_file(
         grid.create_dataset("physicalBoundsMax", data=geometry.physical_bounds_max)
         grid.create_dataset("paddedBoundsMin", data=geometry.padded_bounds_min)
         grid.create_dataset("paddedBoundsMax", data=geometry.padded_bounds_max)
-        grid.create_dataset("cellCounts", data=geometry.cell_counts)
+        grid.create_dataset(
+            "cellCounts", data=np.asarray(geometry.cell_counts, np.uint64)
+        )
+        wall_geometry = file.create_group("wallGeometry")
+        wall_geometry.attrs["geometryFormatVersion"] = "compactRigidBody-v1"
+        wall_geometry.attrs["bodyUuidsJson"] = json.dumps(["body-uuid-0"])
+        wall_geometry.attrs["coordinateFrame"] = "world-right-handed"
+        wall_geometry.attrs["quaternionOrder"] = "WXYZ"
+        for name in (
+            "quaternionConvention",
+            "coordinateTransform",
+            "timeInterpolation",
+            "velocityDefinition",
+        ):
+            wall_geometry.attrs[name] = hybrid.CONTRACT["wall"][name]
+        wall_geometry.attrs["rasterizationAlgorithm"] = hybrid.CONTRACT["wall"][
+            "rasterizationAlgorithm"
+        ]
+        body = wall_geometry.create_group("bodies/body-000000")
+        body.attrs["bodyType"] = "rigid"
+        body.attrs["motionMode"] = motion_mode
+        if motion_mode == "prescribed-law":
+            body.attrs["motionLawJson"] = json.dumps(
+                {
+                    "originTime": 0.0,
+                    "linearVelocity": [0.0, 0.0, 0.25],
+                    "angularVelocity": [0.0, 0.0, 0.5],
+                }
+            )
+        vertices = np.asarray(
+            [[-2.0, -2.0, 0.0], [2.0, -2.0, 0.0], [2.0, 2.0, 0.0], [-2.0, 2.0, 0.0]],
+            dtype=np.float64,
+        )
+        body.create_dataset("referenceVertices", data=vertices)
+        body.create_dataset(
+            "triangleConnectivity", data=np.asarray([[0, 1, 2], [0, 2, 3]], np.int64)
+        )
+        body.create_dataset("triangleId", data=np.asarray([10, 20], np.int64))
+        body.create_dataset("referenceCentroid", data=vertices.mean(axis=0))
+        body.create_dataset(
+            "referencePose", data=np.asarray([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+        )
         frames = file.create_group("frames")
         frame = frames.create_group("000000000000")
         frame.attrs["macroStepIndex"] = np.uint64(0)
         frame.attrs["timeStart"] = np.array([0.0])
-        frame.attrs["timeEnd"] = np.array([1.0e-4])
-        frame.attrs["aiDeltaTime"] = np.array([1.0e-4])
+        frame.attrs["timeEnd"] = np.array([ai_delta_time])
+        frame.attrs["aiDeltaTime"] = np.array([ai_delta_time])
         frame.attrs["substepCount"] = np.array([2])
         frame.attrs["validGridSupport"] = np.array([1])
         particle = frame.create_group("particle")
@@ -175,17 +230,14 @@ def write_teacher_file(
         )
         particle.create_dataset("targetResidualAcceleration", data=target)
         particle.create_dataset("valid", data=valid)
-        frame_grid = frame.create_group("grid")
-        frame_grid.create_dataset(
-            "wallStart", data=make_wall_channels(geometry).numpy()
+        frame.create_group("grid")
+        state = frame.create_group("wallState")
+        state.attrs["bodyCount"] = 1
+        state.create_dataset(
+            "pose", data=np.asarray([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
         )
-        for name in ("wallStart", "wallEnd"):
-            wall = frame.create_group(name)
-            wall.attrs["bodyUuidsJson"] = np.array(["[]"], dtype=text_type)
-            wall.create_dataset("centerOfMass", data=np.empty((0, 3)))
-            wall.create_dataset("rotationWxyz", data=np.empty((0, 4)))
-            wall.create_dataset("linearVelocity", data=np.empty((0, 3)))
-            wall.create_dataset("angularVelocity", data=np.empty((0, 3)))
+        state.create_dataset("linearVelocity", data=np.zeros((1, 3)))
+        state.create_dataset("angularVelocity", data=np.zeros((1, 3)))
 
 
 class GeometryAndTransferTests(unittest.TestCase):
@@ -205,14 +257,26 @@ class GeometryAndTransferTests(unittest.TestCase):
 
     def test_float32_centers_match_cpp_boundary_rounding(self) -> None:
         geometry = hybrid.GridGeometry(
-            physical_bounds_min=(-0.7274999618530273, -0.44999998807907104,
-                                 -0.30000001192092896),
-            physical_bounds_max=(3.947499990463257, 1.4500000476837158,
-                                 1.2313003540039062),
-            padded_bounds_min=(-0.8774999640882015, -0.5999999903142452,
-                               -0.45000001415610313),
-            padded_bounds_max=(4.1225001104176044, 1.6500000432133675,
-                               1.400000013411045),
+            physical_bounds_min=(
+                -0.7274999618530273,
+                -0.44999998807907104,
+                -0.30000001192092896,
+            ),
+            physical_bounds_max=(
+                3.947499990463257,
+                1.4500000476837158,
+                1.2313003540039062,
+            ),
+            padded_bounds_min=(
+                -0.8774999640882015,
+                -0.5999999903142452,
+                -0.45000001415610313,
+            ),
+            padded_bounds_max=(
+                4.1225001104176044,
+                1.6500000432133675,
+                1.400000013411045,
+            ),
             cell_counts=(100, 45, 37),
             cell_size=0.05000000074505806,
             padding_cells=3,
@@ -291,9 +355,9 @@ class DataAndNormalizationTests(unittest.TestCase):
         self.assertEqual(frame.valid.tolist(), [True, False])
         self.assertTrue(np.isnan(frame.target_residual_acceleration[1]).all())
         self.assertEqual(frame.geometry.tensor_shape, (8, 8, 8))
-        np.testing.assert_array_equal(
-            frame.wall_channels_start, make_wall_channels(frame.geometry).numpy()
-        )
+        self.assertEqual(frame.wall_channels_start.dtype, np.float32)
+        self.assertEqual(frame.wall_channels_start.shape, (8, 8, 8, 8))
+        self.assertGreater(frame.wall_channels_start[0].sum(), 0.0)
 
     def test_hdf5_loader_rejects_duplicate_static_id(self) -> None:
         with tempfile.TemporaryDirectory(prefix="shondy-hybrid-loader-") as directory:
@@ -302,7 +366,9 @@ class DataAndNormalizationTests(unittest.TestCase):
             with self.assertRaisesRegex(hybrid.ContractError, "staticId"):
                 hybrid.load_teacher_trajectory(path)
 
-    def test_training_cli_indexes_then_streams_stored_wall_grid(self) -> None:
+    def test_training_cli_indexes_then_reconstructs_missing_dense_wall_grid(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix="shondy-hybrid-cli-") as directory:
             path = Path(directory) / "teacher.h5"
             write_teacher_file(path)
@@ -312,9 +378,11 @@ class DataAndNormalizationTests(unittest.TestCase):
             self.assertFalse(hasattr(indexes[0], "static_id"))
             frame = hybrid.load_teacher_frame(indexes[0])
 
-        np.testing.assert_array_equal(
-            frame.wall_channels_start,
-            make_wall_channels(frame.geometry).numpy(),
+        self.assertEqual(frame.wall_channels_start.shape, (8, 8, 8, 8))
+        self.assertTrue(
+            np.array_equal(
+                frame.wall_channels_start[7], 1.0 - frame.wall_channels_start[0]
+            )
         )
 
     def test_streaming_statistics_match_eager_statistics(self) -> None:
@@ -349,9 +417,7 @@ class DataAndNormalizationTests(unittest.TestCase):
             indexes = hybrid.index_teacher_trajectory(path)
             split = hybrid.split_trajectories(indexes, fractions=(1.0, 0.0, 0.0))
             dynamic_cache: dict[tuple[str, str, int], torch.Tensor] = {}
-            frame_cache: dict[
-                tuple[str, str, int], hybrid.TrainingFrameData
-            ] = {}
+            frame_cache: dict[tuple[str, str, int], hybrid.TrainingFrameData] = {}
             statistics = hybrid.compute_base_training_statistics_streaming(
                 indexes,
                 split,
@@ -451,6 +517,7 @@ class DataAndNormalizationTests(unittest.TestCase):
 
         self.assertEqual(checkpoint["epoch"], 20)
         self.assertEqual(checkpoint["trainingStandardizedMse"], 0.25)
+        self.assertEqual(checkpoint["modelProfile"], "compact-v1")
         self.assertTrue(checkpoint["modelState"])
         self.assertTrue(
             all(
@@ -812,27 +879,31 @@ class ModelAndExportTests(unittest.TestCase):
             self.assertTrue(particle_onnx_path.is_file())
             self.assertTrue(particle_native_path.is_file())
             self.assertEqual(metadata, disk_metadata)
-            self.assertEqual(metadata["schemaVersion"], 2)
+            self.assertEqual(metadata["schemaVersion"], 3)
             self.assertEqual(metadata["contractRegistrySha256"], hybrid.REGISTRY_SHA256)
             self.assertEqual(
                 metadata["certificationProfile"],
-                hybrid.CONTRACT["certificationProfiles"]["extendedUnverified"],
+                hybrid.CONTRACT["certificationProfiles"]["fixedWall"],
             )
             self.assertEqual(
                 metadata["channels"]["gridBase"],
                 list(hybrid.BASE_GRID_CHANNEL_NAMES),
             )
             self.assertTrue(metadata["target"]["targetIncludesTeacherCollision"])
-            self.assertTrue(metadata["runtime"]["onnxArtifactsProduced"])
             self.assertEqual(
                 metadata["runtime"]["expectedOnnxRuntimeProvider"],
                 "CUDAExecutionProvider",
+            )
+            validation = json.loads(
+                (directory_path / "artifacts/export-validation.json").read_text(
+                    encoding="ascii"
+                )
             )
             for consistency_name in (
                 "gridEncoderConsistency",
                 "particleMlpConsistency",
             ):
-                consistency = metadata["runtime"][consistency_name]
+                consistency = validation[consistency_name]
                 self.assertEqual(consistency["status"], "notRun")
             for artifact_name, path in (
                 ("gridEncoder", grid_onnx_path),
@@ -851,17 +922,9 @@ class ModelAndExportTests(unittest.TestCase):
                 metadata["artifacts"]["particleMlpNative"]["sha256"],
                 native_digest,
             )
-            for artifact_name, path in (
-                ("gridEncoder", grid_path),
-                ("particleMlp", particle_path),
-            ):
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                self.assertEqual(
-                    metadata["artifacts"][artifact_name]["torchscriptCompatibility"][
-                        "sha256"
-                    ],
-                    digest,
-                )
+            self.assertEqual(
+                validation["profileValidation"]["modelProfile"], "compact-v1"
+            )
 
             scripted_grid = torch.jit.load(str(grid_path))
             scripted_particle = torch.jit.load(str(particle_path))
@@ -907,6 +970,13 @@ class ModelAndExportTests(unittest.TestCase):
                 rtol=2.0e-3,
                 atol=1.0e-5,
             )
+            mismatched_metadata = copy.deepcopy(metadata)
+            mismatched_metadata["architecture"]["gridEncoder"]["profile"] = "large-v1"
+            metadata_path.write_text(json.dumps(mismatched_metadata), encoding="ascii")
+            with self.assertRaisesRegex(hybrid.ContractError, "profile|widths"):
+                hybrid.validate_exported_model_profile(
+                    directory_path / "artifacts", expected_profile="large-v1"
+                )
 
 
 if __name__ == "__main__":

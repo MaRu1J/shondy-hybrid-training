@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Streaming training and bundle export for the ShonDy hybrid surrogate"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "shondy-hybrid-contract==1.0.0",
+  "shondy-hybrid-contract==2.0.0",
   "h5py==3.16.0",
   "numpy==2.5.2",
   "onnx==1.22.0",
@@ -27,7 +27,7 @@ test = [
 ]
 
 [tool.setuptools]
-py-modules = ["hybrid_reference_model", "train_hybrid_model"]
+py-modules = ["hybrid_reference_model", "train_hybrid_model", "wall_rasterizer"]
 
 [tool.ruff]
 line-length = 88
@@ -35,4 +35,4 @@ target-version = "py312"
 
 [tool.pytest.ini_options]
 testpaths = ["."]
-python_files = ["test_hybrid_reference_model.py"]
+python_files = ["test_*.py"]
